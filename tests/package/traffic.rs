@@ -1,13 +1,9 @@
-//! Public consumer of the extracted crate. Both peers use their chosen local port.
+use super::completion::{deadline, descriptor, finish};
 use orbit_rdma::{
-    ConnectionParams, Device, HostBuffer, Limits, Operation, Outcome, Permissions, QueueConfig,
-    QueuePair, Reclaim, RemoteAccess, RemoteDescriptor, RemoteWindow, Request, Transfer,
+    ConnectionParams, Device, HostBuffer, Limits, Permissions, QueueConfig, QueuePair,
+    RemoteAccess, Request, Transfer,
 };
-use std::{
-    error::Error,
-    ffi::OsStr,
-    time::{Duration, Instant},
-};
+use std::{error::Error, ffi::OsStr, time::Instant};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 fn connect(left: &Device, right: &Device) -> Result<(QueuePair, QueuePair)> {
@@ -20,44 +16,6 @@ fn connect(left: &Device, right: &Device) -> Result<(QueuePair, QueuePair)> {
     a.connect(&r)?;
     b.connect(&l)?;
     Ok((a, b))
-}
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
-}
-fn descriptor(w: &mut RemoteWindow) -> Result<RemoteDescriptor> {
-    let limit = deadline();
-    loop {
-        if let Some(value) = w.descriptor()? {
-            return Ok(value);
-        }
-        if Instant::now() >= limit {
-            return Err("window bind timed out".into());
-        }
-        std::thread::yield_now();
-    }
-}
-fn finish(q: &mut QueuePair, ops: Vec<Operation>, lengths: &[u32]) -> Result<()> {
-    if ops.len() != lengths.len() {
-        return Err("incomplete native post".into());
-    }
-    let limit = deadline();
-    for (op, &bytes) in ops.into_iter().zip(lengths) {
-        if !op.wait_until(q, limit)? {
-            return Err("payload CQE timed out".into());
-        }
-        let Reclaim::Ready(c) = op.try_reclaim() else {
-            return Err("payload range still held".into());
-        };
-        if c.outcome
-            != (Outcome::Success {
-                bytes,
-                invalidated_rkey: None,
-            })
-        {
-            return Err(format!("unexpected payload outcome {:?}", c.outcome).into());
-        }
-    }
-    Ok(())
 }
 fn one_sided(left: &Device, right: &Device, access: RemoteAccess) -> Result<()> {
     let (mut q, server) = connect(left, right)?;

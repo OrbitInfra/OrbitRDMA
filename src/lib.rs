@@ -41,6 +41,14 @@ pub use queue::{ConnectionParams, QueueConfig, QueuePair};
 #[cfg(target_os = "linux")]
 pub use window::{RemoteAccess, RemoteDescriptor, RemoteWindow};
 
+/// Submit work and poll completions on RC queues owned by another verbs runtime.
+/// Callers retain their QP, CQ, memory registrations and DMA loans. Applications
+/// using OrbitRDMA-owned memory can use the safe [`QueuePair`] API.
+#[cfg(target_os = "linux")]
+pub mod verbs {
+    pub use crate::sys::transfer::{Opcode, PostReceipt, WorkCompletion, WorkRequest, poll, post};
+}
+
 use std::{error, ffi::OsString, fmt, io};
 
 /// Failure to load the host's verbs function table.

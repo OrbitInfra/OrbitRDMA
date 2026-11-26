@@ -19,50 +19,104 @@ impl DataOpcode {
         }
     }
 }
-pub(crate) struct DataWork {
-    pub id: u64,
-    pub opcode: DataOpcode,
-    pub sge: ffi::ibv_sge,
-    pub remote: Option<(u64, u32)>,
-    pub signaled: bool,
-    pub fence: bool,
+/// A single-SGE operation on a reliable connected queue pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opcode {
+    Read {
+        address: u64,
+        rkey: u32,
+    },
+    Write {
+        address: u64,
+        rkey: u32,
+    },
+    Send,
+    /// Send a message and invalidate the specified remote key.
+    SendWithInvalidate {
+        rkey: u32,
+    },
+    Receive,
 }
-pub(crate) fn payload_sge(mr: Mr, addr: u64, length: u32) -> ffi::ibv_sge {
-    // SAFETY: the in-flight loan keeps the live MR and its immutable local key through retirement.
-    let lkey = unsafe { (*mr.0.as_ptr()).lkey };
-    ffi::ibv_sge { addr, length, lkey }
+
+/// A native work request. Constructing a descriptor does not access memory.
+pub struct WorkRequest {
+    id: u64,
+    opcode: Opcode,
+    sge: ffi::ibv_sge,
+    signaled: bool,
+    fence: bool,
 }
-pub(crate) struct Post {
+impl WorkRequest {
+    /// Start with a signaled operation on one registered local byte range.
+    pub fn new(id: u64, opcode: Opcode, address: u64, length: u32, lkey: u32) -> Self {
+        Self {
+            id,
+            opcode,
+            sge: ffi::ibv_sge {
+                addr: address,
+                length,
+                lkey,
+            },
+            signaled: true,
+            fence: false,
+        }
+    }
+    /// Request a send CQE for this work request. Receives always produce a CQE.
+    pub fn signaled(mut self, enabled: bool) -> Self {
+        self.signaled = enabled;
+        self
+    }
+    /// Order this send-queue request after prior outstanding RDMA READs.
+    pub fn fenced(mut self, enabled: bool) -> Self {
+        self.fence = enabled;
+        self
+    }
+}
+pub(crate) fn local_key(mr: Mr) -> u32 {
+    // SAFETY: the in-flight loan holds this MR and its immutable local key.
+    unsafe { (*mr.0.as_ptr()).lkey }
+}
+
+/// The synchronous result of a single native post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostReceipt {
+    /// Exact accepted prefix, or `None` when the entire chain may be in flight.
     pub accepted: Option<usize>,
+    /// Provider status, or EPROTO for a contradictory success receipt.
     pub code: i32,
 }
-impl Post {
+impl PostReceipt {
     fn receipt<T>(code: i32, bad: *mut T, chain: &[T]) -> Self {
-        if code == 0 && bad.is_null() {
-            return Self {
-                accepted: Some(chain.len()),
-                code,
-            };
-        }
         if code == 0 {
-            return Self {
-                accepted: None,
-                code: libc::EPROTO,
+            return if bad.is_null() {
+                Self {
+                    accepted: Some(chain.len()),
+                    code,
+                }
+            } else {
+                Self {
+                    accepted: None,
+                    code: libc::EPROTO,
+                }
             };
         }
-        // Compare against each actual WR. The provider may return an unrelated pointer.
+        // A provider may return a foreign pointer. Never dereference or subtract it.
         Self {
-            accepted: chain.iter().position(|w| std::ptr::eq(w, bad)),
+            accepted: chain.iter().position(|wr| std::ptr::eq(wr, bad)),
             code,
         }
     }
 }
-pub(crate) enum WorkCompletion {
+
+/// A successful completion or the four fields verbs defines on a failed CQE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkCompletion {
     Success {
         id: u64,
         qpn: u32,
         opcode: u32,
         bytes: u32,
+        flags: u32,
         invalidated: Option<u32>,
     },
     Error {
@@ -78,49 +132,97 @@ pub(crate) fn storage<T>(capacity: usize) -> RdmaResult<Vec<T>> {
         .map_err(|_| Error::Exhausted("work request storage"))?;
     Ok(v)
 }
-impl Native {
-    pub(crate) fn post_payload(
-        &self,
-        qp: Qp,
-        entries: &mut [DataWork],
-        receive: bool,
-    ) -> RdmaResult<Post> {
-        // SAFETY: the QP and its context are held by the submitting owner.
-        let ops = unsafe { &(*(*qp.0.as_ptr()).context).ops };
-        if receive {
-            let post = ops.post_recv.ok_or(Error::Unsupported("ibv_post_recv"))?;
-            let mut wrs = storage(entries.len())?;
-            wrs.extend(entries.iter_mut().map(|w| ffi::ibv_recv_wr {
-                wr_id: w.id,
-                sg_list: &mut w.sge,
-                num_sge: 1,
-                ..Default::default()
-            }));
+
+// Single messages and receives need no heap allocation.
+fn chain<T: Default>(
+    count: usize,
+    submit: impl FnOnce(&mut [T]) -> PostReceipt,
+) -> RdmaResult<PostReceipt> {
+    if count == 1 {
+        return Ok(submit(std::slice::from_mut(&mut T::default())));
+    }
+    let mut wrs = storage(count)?;
+    wrs.resize_with(count, T::default);
+    Ok(submit(&mut wrs))
+}
+
+/// Post one SQ or RQ chain. Local validation and allocation errors precede any
+/// provider call. After a call, even a provider error returns a [`PostReceipt`].
+///
+/// # Safety
+///
+/// `qp` must point to a live, compatible libibverbs RC QP and its provider must
+/// remain loaded. All SGEs must refer to registered, permitted memory in its PD.
+/// Keep the QP, registrations, and backing of every possibly accepted request
+/// live and exclude conflicting access through completion or proven QP drain.
+/// The caller owns peer authorization, posting order and completion accounting.
+pub unsafe fn post(qp: NonNull<c_void>, entries: &mut [WorkRequest]) -> Result<PostReceipt, Error> {
+    let receive = entries
+        .first()
+        .ok_or(Error::Invalid("empty work request chain"))?
+        .opcode
+        == Opcode::Receive;
+    for w in entries.iter() {
+        if (w.opcode == Opcode::Receive) != receive
+            || w.sge.length == 0
+            || w.sge.addr.checked_add(u64::from(w.sge.length)).is_none()
+        {
+            return Err(Error::Invalid("work request queue or local range"));
+        }
+        if let Opcode::Read { address, .. } | Opcode::Write { address, .. } = w.opcode {
+            if address.checked_add(u64::from(w.sge.length)).is_none() {
+                return Err(Error::Invalid("remote work request range"));
+            }
+        }
+    }
+    let qp = qp.cast::<ffi::ibv_qp>().as_ptr();
+    // SAFETY: the caller retains this QP and provider context throughout the post.
+    let ops = unsafe { &(*(*qp).context).ops };
+    if receive {
+        let submit = ops.post_recv.ok_or(Error::Unsupported("ibv_post_recv"))?;
+        chain(entries.len(), |wrs: &mut [ffi::ibv_recv_wr]| {
             let mut next = std::ptr::null_mut();
-            for wr in wrs.iter_mut().rev() {
+            for (wr, w) in wrs.iter_mut().zip(entries).rev() {
+                wr.wr_id = w.id;
+                wr.sg_list = &mut w.sge;
+                wr.num_sge = 1;
                 wr.next = next;
                 next = wr;
             }
             let mut bad = std::ptr::null_mut();
-            // SAFETY: the nonempty linked array and SGEs remain stationary until post returns.
-            let code = unsafe { post(qp.0.as_ptr(), next, &mut bad) };
-            Ok(Post::receipt(code, bad, &wrs))
-        } else {
-            let post = ops.post_send.ok_or(Error::Unsupported("ibv_post_send"))?;
-            let mut wrs = storage(entries.len())?;
-            for w in entries {
-                let opcode = match w.opcode {
-                    DataOpcode::Read => ffi::IBV_WR_RDMA_READ,
-                    DataOpcode::Write => ffi::IBV_WR_RDMA_WRITE,
-                    DataOpcode::Send => ffi::IBV_WR_SEND,
-                    DataOpcode::Receive => return Err(Error::Invalid("receive on send queue")),
-                };
-                let mut wr = ffi::ibv_send_wr {
-                    wr_id: w.id,
-                    opcode,
-                    num_sge: 1,
-                    sg_list: &mut w.sge,
-                    ..Default::default()
+            // SAFETY: the WR/SGE chain is stationary through this synchronous provider call.
+            let code = unsafe { submit(qp, next, &mut bad) };
+            PostReceipt::receipt(code, bad, wrs)
+        })
+    } else {
+        let submit = ops.post_send.ok_or(Error::Unsupported("ibv_post_send"))?;
+        chain(entries.len(), |wrs: &mut [ffi::ibv_send_wr]| {
+            let mut next = std::ptr::null_mut();
+            for (wr, w) in wrs.iter_mut().zip(entries).rev() {
+                wr.wr_id = w.id;
+                wr.sg_list = &mut w.sge;
+                wr.num_sge = 1;
+                wr.opcode = match w.opcode {
+                    Opcode::Read { address, rkey } | Opcode::Write { address, rkey } => {
+                        wr.wr.rdma.remote_addr = address;
+                        wr.wr.rdma.rkey = rkey;
+                        if matches!(w.opcode, Opcode::Read { .. }) {
+                            ffi::IBV_WR_RDMA_READ
+                        } else {
+                            ffi::IBV_WR_RDMA_WRITE
+                        }
+                    }
+                    Opcode::SendWithInvalidate { rkey } => {
+                        wr.__bindgen_anon_1.invalidate_rkey = rkey;
+                        ffi::IBV_WR_SEND_WITH_INV
+                    }
+                    Opcode::Send => ffi::IBV_WR_SEND,
+                    Opcode::Receive => {
+                        return PostReceipt {
+                            accepted: Some(0),
+                            code: libc::EINVAL,
+                        };
+                    }
                 };
                 if w.signaled {
                     wr.send_flags |= ffi::IBV_SEND_SIGNALED;
@@ -128,63 +230,76 @@ impl Native {
                 if w.fence {
                     wr.send_flags |= ffi::IBV_SEND_FENCE;
                 }
-                if let Some((addr, key)) = w.remote {
-                    wr.wr.rdma.remote_addr = addr;
-                    wr.wr.rdma.rkey = key;
-                }
-                wrs.push(wr);
-            }
-            let mut next = std::ptr::null_mut();
-            for wr in wrs.iter_mut().rev() {
                 wr.next = next;
                 next = wr;
             }
             let mut bad = std::ptr::null_mut();
-            // SAFETY: all WRs and SGEs live through this single native post. Loans outlive possible DMA.
-            let code = unsafe { post(qp.0.as_ptr(), next, &mut bad) };
-            Ok(Post::receipt(code, bad, &wrs))
-        }
+            // SAFETY: WRs and SGEs are live during post. The caller retains all DMA targets.
+            let code = unsafe { submit(qp, next, &mut bad) };
+            PostReceipt::receipt(code, bad, wrs)
+        })
     }
+}
 
-    pub(crate) fn poll_one(&self, cq: Cq) -> RdmaResult<Option<WorkCompletion>> {
-        // SAFETY: this queue has a single CQ consumer and retains the native context.
-        let poll = unsafe { (*(*cq.0.as_ptr()).context).ops.poll_cq }
-            .ok_or(Error::Unsupported("ibv_poll_cq"))?;
-        let mut wc = ffi::ibv_wc {
-            status: ffi::IBV_WC_GENERAL_ERR,
-            ..Default::default()
-        };
-        // SAFETY: exactly one complete header-sized WC is writable.
-        let count = unsafe { poll(cq.0.as_ptr(), 1, &mut wc) };
-        match count {
-            0 => Ok(None),
-            1 if wc.status != ffi::IBV_WC_SUCCESS => Ok(Some(WorkCompletion::Error {
+/// Poll one native CQE. An empty poll returns `Ok(None)`.
+///
+/// # Safety
+///
+/// `cq` must point to a live, compatible libibverbs CQ. The caller must retain
+/// its context and provider and own dispatch for every QP sharing this CQ.
+pub unsafe fn poll(cq: NonNull<c_void>) -> Result<Option<WorkCompletion>, Error> {
+    let cq = cq.cast::<ffi::ibv_cq>().as_ptr();
+    // SAFETY: the caller retains this CQ and its context throughout the call.
+    let poll = unsafe { (*(*cq).context).ops.poll_cq }.ok_or(Error::Unsupported("ibv_poll_cq"))?;
+    let mut wc = ffi::ibv_wc {
+        status: ffi::IBV_WC_GENERAL_ERR,
+        opcode: ffi::IBV_WC_LOCAL_INV,
+        ..Default::default()
+    };
+    // SAFETY: the provider has space for exactly one WC initialized to failure.
+    match unsafe { poll(cq, 1, &mut wc) } {
+        0 => Ok(None),
+        1 if wc.status != ffi::IBV_WC_SUCCESS => Ok(Some(WorkCompletion::Error {
+            id: wc.wr_id,
+            qpn: wc.qp_num,
+            status: wc.status,
+            vendor: wc.vendor_err,
+        })),
+        1 => {
+            let invalidated = if wc.wc_flags & ffi::IBV_WC_WITH_INV != 0 {
+                // SAFETY: the flags on this successful CQE select the host-order key in the initialized union.
+                Some(unsafe { wc.__bindgen_anon_1.invalidated_rkey })
+            } else {
+                None
+            };
+            Ok(Some(WorkCompletion::Success {
                 id: wc.wr_id,
                 qpn: wc.qp_num,
-                status: wc.status,
-                vendor: wc.vendor_err,
-            })),
-            1 => {
-                let invalidated =
-                    if wc.opcode == ffi::IBV_WC_RECV && wc.wc_flags & ffi::IBV_WC_WITH_INV != 0 {
-                        // SAFETY: on successful RECV the flag selects this host-order union member.
-                        Some(unsafe { wc.__bindgen_anon_1.invalidated_rkey })
-                    } else {
-                        None
-                    };
-                Ok(Some(WorkCompletion::Success {
-                    id: wc.wr_id,
-                    qpn: wc.qp_num,
-                    opcode: wc.opcode,
-                    bytes: wc.byte_len,
-                    invalidated,
-                }))
-            }
-            _ => Err(Error::Native {
-                operation: "ibv_poll_cq",
-                code: count,
-            }),
+                opcode: wc.opcode,
+                bytes: wc.byte_len,
+                flags: wc.wc_flags,
+                invalidated,
+            }))
         }
+        count => Err(Error::Native {
+            operation: "ibv_poll_cq",
+            code: count,
+        }),
+    }
+}
+
+impl Native {
+    pub(crate) fn post_payload(
+        &self,
+        qp: Qp,
+        entries: &mut [WorkRequest],
+    ) -> RdmaResult<PostReceipt> {
+        // SAFETY: QueueData serializes the post and retains physical loans for every possible WR.
+        unsafe { post(qp.0.cast(), entries) }
+    }
+    pub(crate) fn poll_one(&self, cq: Cq) -> RdmaResult<Option<WorkCompletion>> {
+        // SAFETY: the owning queue holds its context and is the sole consumer of this CQ.
+        unsafe { poll(cq.0.cast()) }
     }
 
     pub(crate) fn arm(&self, cq: Cq) -> RdmaResult<()> {

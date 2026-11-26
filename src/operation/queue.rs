@@ -4,6 +4,7 @@ use crate::device::{Charge, Permit};
 use crate::memory::Loan;
 use crate::queue::QueueData;
 use crate::resource::Result;
+use crate::verbs::{Opcode, WorkRequest};
 use crate::{ConnectionParams, QueueConfig, RemoteAccess};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -143,9 +144,11 @@ impl PayloadQueue {
                     } else {
                         p.length
                     };
+                    let invalidated_rkey =
+                        invalidated.filter(|_| p.opcode == sys::DataOpcode::Receive);
                     p.finish(Outcome::Success {
                         bytes: n,
-                        invalidated_rkey: invalidated,
+                        invalidated_rkey,
                     });
                 }
             }
@@ -155,13 +158,13 @@ impl PayloadQueue {
 }
 
 impl Request {
-    fn remote_address(
+    fn native_opcode(
         &self,
         peer: &ConnectionParams,
         local: &ConnectionParams,
         len: u32,
-    ) -> Result<Option<(u64, u32)>> {
-        let address = match self.transfer {
+    ) -> Result<Opcode> {
+        let opcode = match self.transfer {
             Transfer::Read { remote, offset } | Transfer::Write { remote, offset } => {
                 if remote.qpn != peer.qpn || remote.rkey == 0 {
                     return Err(Error::Invalid("remote window or peer QP"));
@@ -174,14 +177,17 @@ impl Request {
                 } else {
                     RemoteAccess::Write
                 };
-                Some((
-                    remote.checked_address(offset, len.into(), direction)?,
-                    remote.rkey,
-                ))
+                let address = remote.checked_address(offset, len.into(), direction)?;
+                let rkey = remote.rkey;
+                match direction {
+                    RemoteAccess::Read => Opcode::Read { address, rkey },
+                    RemoteAccess::Write => Opcode::Write { address, rkey },
+                }
             }
-            Transfer::Send | Transfer::Receive => None,
+            Transfer::Send => Opcode::Send,
+            Transfer::Receive => Opcode::Receive,
         };
-        Ok(address)
+        Ok(opcode)
     }
 }
 
@@ -239,7 +245,7 @@ impl QueueData {
             let opcode = r.transfer.opcode();
             let length =
                 u32::try_from(r.buffer.bounds().len()).map_err(|_| Error::Invalid("SGE length"))?;
-            let remote = r.remote_address(&peer, &local, length)?;
+            let native_opcode = r.native_opcode(&peer, &local, length)?;
             let destination = matches!(r.transfer, Transfer::Read { .. } | Transfer::Receive);
             let loan = r.buffer.dma(&self.domain, destination)?;
             let permit = self.domain.reserve(Charge::Payload {
@@ -253,14 +259,17 @@ impl QueueData {
                 || opcode == sys::DataOpcode::Read
                 || end
                 || id - group + 1 >= u64::from(interval);
-            wrs.push(sys::DataWork {
-                id,
-                opcode,
-                sge: sys::payload_sge(loan.mr()?, loan.address(), length),
-                remote,
-                signaled,
-                fence,
-            });
+            wrs.push(
+                WorkRequest::new(
+                    id,
+                    native_opcode,
+                    loan.address(),
+                    length,
+                    sys::local_key(loan.mr()?),
+                )
+                .signaled(signaled)
+                .fenced(fence),
+            );
             records.push(Pending {
                 id,
                 group,
@@ -277,7 +286,7 @@ impl QueueData {
                 group = id + 1;
             }
         }
-        let receipt = self.api.post_payload(qp, &mut wrs, receive)?;
+        let receipt = self.api.post_payload(qp, &mut wrs)?;
         if receipt.accepted == Some(0) {
             return Err(Error::Native {
                 operation: if receive {

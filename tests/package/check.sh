@@ -20,7 +20,7 @@ mkdir -p "$work/pkg" "$work/consumer/src" "$work/fixture" "$work/root"
 tar -xf "$archive" --strip-components=1 -C "$work/pkg"
 cp "$work/pkg/tests/package/probe.rs" "$work/consumer/src/main.rs"
 cp "$work/pkg/tests/package/connection.rs" "$work/consumer/src/"
-cp "$work/pkg/tests/package/traffic.rs" "$work/consumer/src/"
+cp "$work/pkg/tests/package/"{traffic,completion,host_peer,host_peer_wire}.rs "$work/consumer/src/"
 cp "$work/pkg/Cargo.lock" "$work/consumer/"
 cargo test --offline --locked --manifest-path "$work/pkg/Cargo.toml" --test owners
 cat > "$work/consumer/Cargo.toml" <<'TOML'
@@ -28,6 +28,10 @@ cat > "$work/consumer/Cargo.toml" <<'TOML'
 name = "orbit-rdma-consumer"
 version = "0.0.0"
 edition = "2024"
+
+[[bin]]
+name = "host_peer"
+path = "src/host_peer.rs"
 
 [dependencies]
 orbit-rdma = { path = "../pkg" }

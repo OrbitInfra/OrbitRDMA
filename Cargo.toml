@@ -1,12 +1,19 @@
 [package]
 name = "orbit-rdma"
-version = "0.1.0-dev.3"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Linux RC RDMA transfers with registered host buffers and explicit completion receipts"
 license = "Apache-2.0"
+repository = "https://github.com/OrbitInfra/OrbitRDMA"
+keywords = ["rdma", "infiniband", "roce", "verbs"]
+categories = ["network-programming"]
 readme = "README.md"
 include = ["src/**", "tests/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "docs/development-plan.md"]
+
+[[example]]
+name = "host_peer"
+path = "tests/package/host_peer.rs"
 
 [dependencies]
 libloading = "0.8.9"
