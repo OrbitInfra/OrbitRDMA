@@ -13,6 +13,8 @@ compile_error!("orbit-rdma requires a Linux target and rdma-core development hea
 #[cfg(target_os = "linux")]
 mod device;
 #[cfg(target_os = "linux")]
+mod keys;
+#[cfg(target_os = "linux")]
 mod memory;
 #[cfg(target_os = "linux")]
 mod operation;

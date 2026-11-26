@@ -7,7 +7,9 @@ pub mod abi;
 use abi as ffi;
 mod cq;
 mod device;
+pub mod inventory;
 mod memory;
+pub use crate::keys::KeyHistory;
 #[cfg(feature = "mlx5")]
 pub mod mlx5;
 pub mod port;

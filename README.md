@@ -72,7 +72,7 @@ Drive the QP with `progress()`, or call `op.wait_until(&mut qp, deadline)`. A ti
 
 OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. The loader calls the host's rdma-core runtime through a private function table. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
 
-The optional `provider` feature lets engines manage shared completion queues,
+The optional `provider` feature provides Linux port and GID inventory and bounded per-PD key history. It lets engines manage shared completion queues,
 protection domains, RC transitions, memory registrations and asynchronous device
 events. Native resources may be present after a failed create. The caller must
 retain those slots, their parents and the backing until successful retirement.

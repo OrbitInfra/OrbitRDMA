@@ -1,0 +1,72 @@
+use super::*;
+
+#[test]
+fn every_tag_is_burned_once_even_when_native_allocation_changes_its_initial_tag() {
+    let mut keys = KeyHistory::new(1);
+    let mut used = std::collections::HashSet::new();
+    for _ in 0..255u32 {
+        let native = 0x12345601;
+        let key = keys.burn(native).unwrap();
+        assert_ne!(key, native);
+        assert_eq!(key & !255, 0x12345600);
+        assert!(used.insert(key));
+    }
+    assert!(matches!(keys.burn(0x12345601), Err(Error::Exhausted(_))));
+    // A different initial tag may make the sole never-published value eligible.
+    let final_key = keys.burn(0x12345602).unwrap();
+    assert_eq!(final_key, 0x12345601);
+    assert!(used.insert(final_key));
+    assert_eq!(used.len(), 256);
+    assert_eq!(keys.len(), 1);
+    for tag in 0..256 {
+        assert!(matches!(
+            keys.burn(0x12345600 | tag),
+            Err(Error::Exhausted(_))
+        ));
+    }
+    assert!(matches!(keys.burn(0x65432101), Err(Error::Exhausted(_))));
+    assert_eq!(keys.len(), 1);
+}
+
+#[test]
+fn index_capacity_preserves_old_history_and_existing_index_capacity() {
+    let mut keys = KeyHistory::new(2);
+    assert_eq!(keys.burn(0x101).unwrap(), 0x102);
+    assert_eq!(keys.burn(0x201).unwrap(), 0x202);
+    assert!(matches!(keys.burn(0x301), Err(Error::Exhausted(_))));
+    assert_eq!(keys.burn(0x101).unwrap(), 0x103);
+    assert_eq!(keys.burn(0x201).unwrap(), 0x203);
+    assert_eq!(keys.len(), 2);
+}
+
+#[test]
+fn named_gpu_keys_and_host_windows_share_the_pd_history_and_index_limit() {
+    let mut keys = KeyHistory::new(1);
+    let named = 0x123411;
+    assert!(keys.claim_exact(named).unwrap());
+    assert!(!keys.claim_exact(named).unwrap());
+    assert_eq!(keys.burn(named - 1).unwrap(), named + 1);
+    assert!(!keys.claim_exact(named + 1).unwrap());
+    assert!(matches!(
+        keys.claim_exact(named + 256),
+        Err(Error::Exhausted(_))
+    ));
+    for tag in 0..=255 {
+        keys.claim_exact((named & !255) | tag).unwrap();
+    }
+    assert!(matches!(keys.burn(named), Err(Error::Exhausted(_))));
+}
+
+#[test]
+fn a_zero_key_is_never_published_and_other_indices_can_use_a_zero_tag() {
+    let mut keys = KeyHistory::new(2);
+    assert!(keys.is_empty());
+    assert!(matches!(keys.claim_exact(0), Err(Error::Invalid(_))));
+    assert_eq!(keys.burn(255).unwrap(), 1);
+    assert_eq!(keys.burn(511).unwrap(), 256);
+    for tag in 1..=255 {
+        keys.claim_exact(tag).unwrap();
+    }
+    assert!(keys.exhausted(1));
+    assert!(matches!(keys.burn(1), Err(Error::Exhausted(_))));
+}

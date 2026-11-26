@@ -290,3 +290,15 @@ pub unsafe extern "C" fn destroy(key: *mut c_void) -> c_int {
 #[cfg(test)]
 #[path = "../../tests/unit/gpu_key_mailbox.rs"]
 mod tests;
+
+/// Detect the peer-memory modules used by NVIDIA and MLNX_OFED.
+pub fn peermem_at(root: &std::path::Path) -> bool {
+    // NCCL's ibGdrSupportInitOnce recognizes both MLNX_OFED and NVIDIA modules.
+    [
+        "sys/kernel/mm/memory_peers/nv_mem/version",
+        "sys/kernel/mm/memory_peers/nv_mem_nc/version",
+        "sys/module/nvidia_peermem/version",
+    ]
+    .iter()
+    .any(|path| root.join(path).exists())
+}
