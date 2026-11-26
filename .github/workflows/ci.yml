@@ -1,0 +1,25 @@
+name: Linux CPU
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  provider:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        rust: [stable, 1.85.0]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install verbs headers and compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc clang libclang-dev libibverbs-dev binutils
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      - name: CPU tests and packaged consumer
+        run: bash tests/cpu.sh

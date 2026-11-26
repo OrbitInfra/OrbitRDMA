@@ -1,0 +1,23 @@
+[package]
+name = "orbit-rdma"
+version = "0.1.0-dev.3"
+edition = "2024"
+rust-version = "1.85"
+description = "Linux RC RDMA transfers with registered host buffers and explicit completion receipts"
+license = "Apache-2.0"
+readme = "README.md"
+include = ["src/**", "tests/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "docs/development-plan.md"]
+
+[dependencies]
+libloading = "0.8.9"
+libc = "0.2.191"
+
+[build-dependencies]
+bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }
+cc = "1.9.0"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
