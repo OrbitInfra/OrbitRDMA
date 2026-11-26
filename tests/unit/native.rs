@@ -91,6 +91,8 @@ fn table_retains_loaded_code_with_and_without_optional_port_speed() {
         let close_status = unsafe { (native.ibv_close_device)(std::ptr::null_mut()) };
         assert_eq!(close_status, libc::EIO);
         assert_eq!(native.port_speed.is_some(), optional);
+        #[cfg(feature = "mlx5")]
+        assert_eq!(native.dmabuf.is_some(), optional);
         if let Some(speed) = native.port_speed {
             let mut value = 0;
             // SAFETY: our fixture ignores the context pointer and writes one u64.

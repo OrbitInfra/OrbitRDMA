@@ -198,6 +198,7 @@ struct ibv_context *ibv_open_device(struct ibv_device *d) {
         if (!c)
             return NULL;
     }
+    c->async_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     c->device = d;
     c->ops.alloc_mw = alloc_mw;
     c->ops.dealloc_mw = free_mw;
@@ -212,6 +213,7 @@ int ibv_close_device(struct ibv_context *c) {
         return EIO;
     if (!c)
         return EINVAL;
+    close(c->async_fd);
     struct verbs_context *extended = verbs_get_ctx(c);
     if (extended)
         free(extended);
@@ -302,14 +304,15 @@ int ibv_destroy_comp_channel(struct ibv_comp_channel *h) {
 struct ibv_cq *ibv_create_cq(struct ibv_context *c, int n, void *v, struct ibv_comp_channel *h,
                              int i) {
     (void)v;
-    if (event("cq") || c != h->context || n <= 0 || n > 192 || i)
+    if (event("cq") || (h && c != h->context) || n <= 0 || n > 192 || i)
         return NULL;
     struct test_cq *cq = calloc(1, sizeof(*cq));
     if (!cq)
         return NULL;
     cq->cq.context = c;
     cq->cq.channel = h;
-    ((struct test_channel *)h)->cq = cq;
+    if (h)
+        ((struct test_channel *)h)->cq = cq;
     cq->cq.cqe = is("small_cq") ? n - 1 : n;
     return &cq->cq;
 }
@@ -350,8 +353,8 @@ int ibv_dereg_mr(struct ibv_mr *m) {
     return 0;
 }
 struct ibv_qp *ibv_create_qp(struct ibv_pd *p, struct ibv_qp_init_attr *a) {
-    if (event("qp") || a->qp_type != IBV_QPT_RC || a->send_cq != a->recv_cq ||
-        a->send_cq->context != p->context || a->cap.max_send_sge != 1 || a->cap.max_recv_sge != 1 ||
+    if (event("qp") || a->qp_type != IBV_QPT_RC || (is("shared_cqs") ? a->send_cq == a->recv_cq : a->send_cq != a->recv_cq) ||
+        a->send_cq->context != p->context || a->recv_cq->context != p->context || a->cap.max_send_sge != 1 || a->cap.max_recv_sge != 1 ||
         a->sq_sig_all != 0)
         return NULL;
     struct test_qp *q = calloc(1, sizeof(*q));
@@ -385,6 +388,12 @@ unsigned orbit_attr(int n) {
         return rts.max_rd_atomic;
     case 6:
         return rtr.ah_attr.grh.sgid_index;
+    case 8:
+        return rtr.ah_attr.sl;
+    case 9:
+        return rtr.ah_attr.grh.traffic_class;
+    case 10:
+        return rtr.ah_attr.grh.hop_limit;
     default:
         return rtr.ah_attr.dlid;
     }
@@ -397,7 +406,7 @@ int ibv_modify_qp(struct ibv_qp *base, struct ibv_qp_attr *a, int mask) {
             return EIO;
         if (q->stage ||
             mask != (IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) ||
-            a->qp_access_flags != (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE) ||
+            a->qp_access_flags != (is("shared_cqs") ? IBV_ACCESS_REMOTE_READ : (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)) ||
             !a->port_num || a->pkey_index)
             return EINVAL;
         break;

@@ -16,6 +16,8 @@ mod device;
 mod memory;
 #[cfg(target_os = "linux")]
 mod operation;
+#[cfg(all(target_os = "linux", feature = "provider"))]
+pub mod provider;
 #[cfg(target_os = "linux")]
 mod queue;
 #[cfg(target_os = "linux")]

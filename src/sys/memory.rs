@@ -1,4 +1,5 @@
 //! Adapted from OrbiTE's sys/memory.rs. Only the exact bound window grants remote access.
+use super::transfer::PostReceipt;
 use super::*;
 use crate::RemoteAccess;
 
@@ -57,39 +58,21 @@ impl Native {
         Ok(())
     }
     pub(crate) fn post_window(&self, qp: Qp, key: u32, binding: Option<Bind>) -> RdmaResult<()> {
-        let mut wr = ffi::ibv_send_wr {
-            send_flags: ffi::IBV_SEND_SIGNALED,
-            ..Default::default()
-        };
-        if let Some(b) = binding {
-            wr.wr_id = 1;
-            wr.opcode = ffi::IBV_WR_BIND_MW;
-            wr.__bindgen_anon_2.bind_mw.mw = b.mw.0.as_ptr();
-            wr.__bindgen_anon_2.bind_mw.rkey = key;
-            wr.__bindgen_anon_2.bind_mw.bind_info = ffi::ibv_mw_bind_info {
-                mr: b.mr.0.as_ptr(),
-                addr: b.address,
-                length: b.length as u64,
-                mw_access_flags: match b.access {
-                    RemoteAccess::Read => ffi::IBV_ACCESS_REMOTE_READ,
-                    RemoteAccess::Write => ffi::IBV_ACCESS_REMOTE_WRITE,
-                },
-            };
-        } else {
-            wr.wr_id = 2;
-            wr.opcode = ffi::IBV_WR_LOCAL_INV;
-            wr.__bindgen_anon_1.invalidate_rkey = key;
-        }
-        // SAFETY: the QP's owner serializes posts and retains every referenced resource.
-        let post = unsafe { (*(*qp.0.as_ptr()).context).ops.post_send }
-            .ok_or(Error::Unsupported("post_send"))?;
-        let mut bad = std::ptr::null_mut();
-        // SAFETY: the provider consumes the stack WR during this call. On any
-        // submit error the owner tears down the QP before freeing potential DMA targets.
-        check("ibv_post_send window", unsafe {
-            post(qp.0.as_ptr(), &mut wr, &mut bad)
-        })
+        let id = if binding.is_some() { 1 } else { 2 };
+        let binding = binding.map(|b| WindowBind {
+            mr: b.mr,
+            mw: b.mw,
+            address: b.address,
+            length: b.length,
+            access: match b.access {
+                RemoteAccess::Read => ffi::IBV_ACCESS_REMOTE_READ,
+                RemoteAccess::Write => ffi::IBV_ACCESS_REMOTE_WRITE,
+            },
+        });
+        let result = post_window(qp, id, key, binding)?;
+        check("ibv_post_send window", result.code)
     }
+
     pub(crate) fn completion(&self, cq: Cq, qpn: u32, bind: bool) -> RdmaResult<bool> {
         let Some(wc) = self.poll_one(cq)? else {
             return Ok(false);
@@ -119,4 +102,46 @@ impl Native {
             _ => Err(Error::Invalid("foreign window CQE or opcode")),
         }
     }
+}
+
+pub(crate) struct WindowBind {
+    pub mw: Mw,
+    pub mr: Mr,
+    pub address: u64,
+    pub length: usize,
+    pub access: u32,
+}
+pub(crate) fn post_window(
+    qp: Qp,
+    id: u64,
+    key: u32,
+    binding: Option<WindowBind>,
+) -> RdmaResult<PostReceipt> {
+    let mut wr = ffi::ibv_send_wr {
+        wr_id: id,
+        send_flags: ffi::IBV_SEND_SIGNALED,
+        ..Default::default()
+    };
+    if let Some(b) = binding {
+        wr.opcode = ffi::IBV_WR_BIND_MW;
+        wr.__bindgen_anon_2.bind_mw.mw = b.mw.0.as_ptr();
+        wr.__bindgen_anon_2.bind_mw.rkey = key;
+        wr.__bindgen_anon_2.bind_mw.bind_info = ffi::ibv_mw_bind_info {
+            mr: b.mr.0.as_ptr(),
+            addr: b.address,
+            length: b.length as u64,
+            mw_access_flags: b.access,
+        };
+    } else {
+        wr.opcode = ffi::IBV_WR_LOCAL_INV;
+        wr.__bindgen_anon_1.invalidate_rkey = key;
+    }
+    // SAFETY: the QP's owner serializes posts and retains every referenced resource.
+    let post = unsafe { (*(*qp.0.as_ptr()).context).ops.post_send }
+        .ok_or(Error::Unsupported("post_send"))?;
+    let mut bad = std::ptr::null_mut();
+    // SAFETY: the provider consumes the stack WR during this call. On any
+    // submit error the owner tears down the QP before freeing potential DMA targets.
+    let code = unsafe { post(qp.0.as_ptr(), &mut wr, &mut bad) };
+    Ok(PostReceipt::receipt(code, bad, std::slice::from_ref(&wr)))
 }

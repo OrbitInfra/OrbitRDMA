@@ -2,7 +2,7 @@
 
 OrbitRDMA is a Rust library for moving bytes between registered host buffers over Linux RDMA. It supports one-sided READ/WRITE and two-sided SEND/RECV on reliable connected (RC) queue pairs. The application chooses its control channel and decides which ranges to expose.
 
-The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.0` supports batch submission, polling and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
+The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.1` supports batch submission, polling and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
 
 ## Try device discovery
 
@@ -72,7 +72,16 @@ Drive the QP with `progress()`, or call `op.wait_until(&mut qp, deadline)`. A ti
 
 OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. The loader calls the host's rdma-core runtime through a private function table. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
 
-OrbiTE uses the same WR posting and CQ decoding as the standalone library. Its progress workers pass their live queue handles to `verbs::post` and `verbs::poll`. OrbiTE owns each QP, shared CQ, cross-transport memory loan, peer grant and retry decision. The safe `QueuePair` API owns those resources for standalone applications. [OrbiTE RDMA implementation](https://github.com/OrbitInfra/OrbiTE/tree/main/src/transport/rdma) · [Integration boundary](docs/development-plan.md#extraction-map)
+The optional `provider` feature lets engines manage shared completion queues,
+protection domains, RC transitions, memory registrations and asynchronous device
+events. Native resources may be present after a failed create. The caller must
+retain those slots, their parents and the backing until successful retirement.
+The optional `mlx5` feature adds dma-buf MR registration and verified exact-range
+DevX keys. The application retains the export FD through deregistration.
+
+OrbiTE uses these operations and `verbs::{post,poll}`. Its progress workers
+own scheduling, peer grants, cross-transport memory loans and CUDA exports.
+[OrbiTE integration](https://github.com/OrbitInfra/OrbiTE/pull/227)
 
 ## Check two peers
 
