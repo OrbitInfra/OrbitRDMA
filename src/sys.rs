@@ -14,11 +14,11 @@ use crate::LoadError;
 mod device;
 mod memory;
 mod queue;
-mod transfer;
+pub(crate) mod transfer;
 pub(crate) use device::{Caps, Context, Pd};
 pub(crate) use memory::{Bind, Mr, Mw};
 pub(crate) use queue::{Channel, Cq, Qp};
-pub(crate) use transfer::{DataOpcode, DataWork, WorkCompletion, payload_sge, storage};
+pub(crate) use transfer::{DataOpcode, WorkCompletion, local_key, storage};
 
 // Private C layouts generated from the build host's verbs.h.
 #[allow(

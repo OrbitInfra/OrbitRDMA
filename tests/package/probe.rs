@@ -1,3 +1,4 @@
+mod completion;
 mod connection;
 mod traffic;
 use std::ffi::OsStr;

@@ -2,11 +2,11 @@
 
 OrbitRDMA is a Rust library for moving bytes between registered host buffers over Linux RDMA. It supports one-sided READ/WRITE and two-sided SEND/RECV on reliable connected (RC) queue pairs. The application chooses its control channel and decides which ranges to expose.
 
-The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.0-dev.3` includes batch submission, polling, and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
+The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.0` supports batch submission, polling and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
 
 ## Try device discovery
 
-Use stable Rust or Rust 1.85.0 on Linux. On Debian or Ubuntu, install `build-essential`, `libclang-dev` and `libibverbs-dev`. Add the checkout to an application with `cargo add --path /path/to/OrbitRDMA`, then call the public API.
+Use stable Rust or Rust 1.85.0 on Linux. On Debian or Ubuntu, install `build-essential`, `libclang-dev` and `libibverbs-dev`. Add the dependency with `cargo add orbit-rdma@0.1`.
 
 ```rust
 fn main() -> Result<(), orbit_rdma::Error> {
@@ -72,7 +72,20 @@ Drive the QP with `progress()`, or call `op.wait_until(&mut qp, deadline)`. A ti
 
 OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. The loader calls the host's rdma-core runtime through a private function table. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
 
-OrbiTE is the first intended consumer. It will use OrbitRDMA for the RDMA operations beneath its peer protocol, multi-rail scheduling, CUDA staging and transport failover. A storage engine can use the same crate for its own replication protocol. Across releases, both should be able to rely on the same rules for buffer reuse and reproduce performance and failure results on supported hardware. GPU DMA-BUF registration is a candidate for a later release. [OrbiTE source used for the extraction](https://github.com/OrbitInfra/OrbiTE/tree/e4a12a20b4f47201c48f9e562aa5d95ea1db83e4/src/transport/rdma)
+OrbiTE uses the same WR posting and CQ decoding as the standalone library. Its progress workers pass their live queue handles to `verbs::post` and `verbs::poll`. OrbiTE owns each QP, shared CQ, cross-transport memory loan, peer grant and retry decision. The safe `QueuePair` API owns those resources for standalone applications. [OrbiTE RDMA implementation](https://github.com/OrbitInfra/OrbiTE/tree/main/src/transport/rdma) · [Integration boundary](docs/development-plan.md#extraction-map)
+
+## Check two peers
+
+Build `cargo build --locked --release --example host_peer` on Linux. On a pair of hosts with an RC provider supporting type-2B memory windows, run the listener first. Each host selects its own device, port and GID index.
+
+```sh
+# Listener
+target/release/examples/host_peer listen 0.0.0.0:7400 mlx5_0 1 0
+# Requester (substitute the listener's reachable address)
+target/release/examples/host_peer connect 192.0.2.1:7400 mlx5_0 1 0
+```
+
+Both processes check each transferred byte and the surrounding guards. TCP carries QP parameters, window descriptors and acknowledgements. READ, WRITE, SEND and RECV use the verbs provider. Linux CPU tests cover partial posts, delayed completions, failed cleanup and packaged consumers. Two-host RNIC qualification and performance measurements for this version are pending. [Two-peer consumer](tests/package/host_peer.rs) · [Verification plan](docs/development-plan.md#release-decision)
 
 ## License and provenance
 
