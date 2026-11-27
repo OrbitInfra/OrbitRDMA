@@ -7,6 +7,9 @@ cargo fmt --all -- --check
 rustfmt --edition 2024 --check tests/package/probe.rs
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+cargo clippy --locked --all-features --all-targets -- -D warnings
+cargo test --locked --features provider
+cargo test --locked --all-features
 cargo test --locked --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 bash tests/package/check.sh

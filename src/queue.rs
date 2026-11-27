@@ -119,12 +119,12 @@ impl Device {
             let r = owner.get_mut()?;
             let channel = api.channel(ctx)?;
             r.channel = Some(channel);
-            let (cq, enough_entries) = api.cq(ctx, channel, depth as i32)?;
+            let (cq, enough_entries) = api.cq(ctx, Some(channel), depth as i32)?;
             r.cq = Some(cq);
             if !enough_entries {
                 return Err(Error::Unsupported("requested CQ depth"));
             }
-            let (qp, qpn, sized) = api.qp(pd, cq, &config)?;
+            let (qp, qpn, sized) = api.qp(pd, cq, cq, config.send_depth, config.receive_depth)?;
             r.qp = Some(qp);
             if !sized {
                 return Err(Error::Unsupported("requested QP depth"));
@@ -140,7 +140,7 @@ impl Device {
                 responder_depth: config.read_depth.min(caps.responder),
             };
             local.validate(port.link)?;
-            api.init(qp, port.number)?;
+            api.init(qp, port.number, sys::RC_READ_WRITE)?;
             Ok(local)
         })();
         let local = create.map_err(|e| owner.rollback(e))?;
@@ -181,7 +181,25 @@ impl QueuePair {
             return Err(Error::Invalid("selected route changed"));
         }
         let qp = data.qp.ok_or(Error::Closed)?;
-        if let Err(e) = data.api.connect(qp, port, &self.local, peer) {
+        if let Err(e) = data.api.connect(
+            qp,
+            sys::RcPath {
+                port: port.number,
+                gid_index: port.gid_index,
+                global: port.link != crate::Link::InfiniBand || peer.gid != [0; 16],
+                mtu: self.local.mtu.min(peer.mtu),
+                remote_qpn: peer.qpn,
+                remote_psn: peer.psn,
+                local_psn: self.local.psn,
+                lid: peer.lid,
+                gid: peer.gid,
+                initiator: self.local.initiator_depth.min(peer.responder_depth),
+                responder: self.local.responder_depth.min(peer.initiator_depth),
+                service_level: 0,
+                traffic_class: 0,
+                hop_limit: 64,
+            },
+        ) {
             return Err(self.owner.rollback(e));
         }
         self.peer = Some(*peer);

@@ -690,3 +690,78 @@ fn recycled_qpn_cannot_restore_a_revoked_range_and_caps_fail_before_admission() 
         },
     );
 }
+
+#[cfg(feature = "provider")]
+#[test]
+#[allow(unsafe_code)]
+fn shared_completion_queues_and_partial_rc_creation() {
+    use orbit_rdma::provider as verbs;
+    isolated(
+        "shared_completion_queues_and_partial_rc_creation",
+        |fixture| {
+            fixture.option("shared_cqs");
+            let mut device = verbs::DeviceHandles::default();
+            let mut send = verbs::CqHandles::default();
+            let mut recv = verbs::CqHandles::default();
+            // SAFETY: this isolated test exclusively owns every native handle from the fixture.
+            // It retires live and partially created QPs before their CQs, then the PD and device.
+            unsafe {
+                assert_eq!(verbs::open_device(&mut device, c"cpu-first".as_ptr()), 0);
+                assert_eq!(
+                    verbs::create_cq(&mut send, &device, 32, std::ptr::null_mut()),
+                    0
+                );
+                assert_eq!(
+                    verbs::create_cq(&mut recv, &device, 16, std::ptr::null_mut()),
+                    0
+                );
+                let mut queue = verbs::ConnectionHandles {
+                    cq: send.cq,
+                    receive_cq: recv.cq,
+                    read_depth: verbs::ReadDepth {
+                        initiator: 2,
+                        responder: 3,
+                    },
+                    ..Default::default()
+                };
+                let qpn = verbs::open_rc(&mut queue, device.pd, 1, 1, 8, 4).unwrap();
+                let endpoint = verbs::Endpoint {
+                    qpn,
+                    psn: 3,
+                    gid: [1; 16],
+                    link_layer: 2,
+                    mtu: 4,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    verbs::connect(&mut queue, &endpoint, &endpoint, 1, 1, 5, 17, 32),
+                    0
+                );
+                assert_eq!(
+                    [
+                        fixture.attr(4),
+                        fixture.attr(5),
+                        fixture.attr(8),
+                        fixture.attr(9),
+                        fixture.attr(10)
+                    ],
+                    [3, 2, 5, 17, 32]
+                );
+                assert_eq!(verbs::destroy_qp(&mut queue), 0);
+                fixture.fault("init", "");
+                assert_eq!(
+                    verbs::open_rc(&mut queue, device.pd, 1, 1, 8, 4),
+                    Err(libc::EIO)
+                );
+                assert!(!queue.qp.is_null());
+                assert_eq!(fixture.count("free_qp"), 1);
+                assert_eq!(verbs::destroy_qp(&mut queue), 0);
+                assert!(queue.qp.is_null());
+                assert_eq!(verbs::destroy_cq(&mut recv), 0);
+                assert_eq!(verbs::destroy_cq(&mut send), 0);
+                assert_eq!(verbs::dealloc_pd(&mut device), 0);
+                assert_eq!(verbs::close_device(&mut device), 0);
+            }
+        },
+    );
+}

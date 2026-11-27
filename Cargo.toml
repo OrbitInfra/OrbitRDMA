@@ -1,6 +1,6 @@
 [package]
 name = "orbit-rdma"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Linux RC RDMA transfers with registered host buffers and explicit completion receipts"
@@ -14,6 +14,11 @@ include = ["src/**", "tests/**", "build.rs", "Cargo.toml", "Cargo.lock", "README
 [[example]]
 name = "host_peer"
 path = "tests/package/host_peer.rs"
+
+[features]
+default = []
+provider = []
+mlx5 = ["provider"]
 
 [dependencies]
 libloading = "0.8.9"

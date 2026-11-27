@@ -86,7 +86,7 @@ pub struct PostReceipt {
     pub code: i32,
 }
 impl PostReceipt {
-    fn receipt<T>(code: i32, bad: *mut T, chain: &[T]) -> Self {
+    pub(super) fn receipt<T>(code: i32, bad: *mut T, chain: &[T]) -> Self {
         if code == 0 {
             return if bad.is_null() {
                 Self {

@@ -1,10 +1,27 @@
 //! Adapted from OrbiTE sys/qp.rs. RC attributes and masks are paired by transition.
 use super::*;
-use crate::{ConnectionParams, Port, QueueConfig};
 
 pub(crate) type Channel = Handle<ffi::ibv_comp_channel>;
 pub(crate) type Cq = Handle<ffi::ibv_cq>;
 pub(crate) type Qp = Handle<ffi::ibv_qp>;
+
+/// Route and negotiated read limits to program in the two RC transitions.
+pub(crate) struct RcPath {
+    pub port: u8,
+    pub gid_index: u8,
+    pub global: bool,
+    pub mtu: u8,
+    pub remote_qpn: u32,
+    pub remote_psn: u32,
+    pub local_psn: u32,
+    pub lid: u16,
+    pub gid: [u8; 16],
+    pub initiator: u8,
+    pub responder: u8,
+    pub service_level: u8,
+    pub traffic_class: u8,
+    pub hop_limit: u8,
+}
 
 impl Native {
     pub(crate) fn channel(&self, ctx: Context) -> RdmaResult<Channel> {
@@ -14,7 +31,12 @@ impl Native {
             "ibv_create_comp_channel",
         )
     }
-    pub(crate) fn cq(&self, ctx: Context, channel: Channel, depth: i32) -> RdmaResult<(Cq, bool)> {
+    pub(crate) fn cq(
+        &self,
+        ctx: Context,
+        channel: Option<Channel>,
+        depth: i32,
+    ) -> RdmaResult<(Cq, bool)> {
         let cq = handle(
             // SAFETY: this channel belongs to ctx and outlives the new CQ.
             unsafe {
@@ -22,7 +44,7 @@ impl Native {
                     ctx.0.as_ptr(),
                     depth,
                     std::ptr::null_mut(),
-                    channel.0.as_ptr(),
+                    channel.map_or(std::ptr::null_mut(), |ch| ch.0.as_ptr()),
                     0,
                 )
             },
@@ -31,14 +53,21 @@ impl Native {
         // SAFETY: the newly created CQ reports its actual number of entries.
         Ok((cq, unsafe { (*cq.0.as_ptr()).cqe } >= depth))
     }
-    pub(crate) fn qp(&self, pd: Pd, cq: Cq, config: &QueueConfig) -> RdmaResult<(Qp, u32, bool)> {
+    pub(crate) fn qp(
+        &self,
+        pd: Pd,
+        send: Cq,
+        receive: Cq,
+        send_depth: u32,
+        receive_depth: u32,
+    ) -> RdmaResult<(Qp, u32, bool)> {
         let mut init = ffi::ibv_qp_init_attr {
-            send_cq: cq.0.as_ptr(),
-            recv_cq: cq.0.as_ptr(),
+            send_cq: send.0.as_ptr(),
+            recv_cq: receive.0.as_ptr(),
             qp_type: ffi::IBV_QPT_RC,
             cap: ffi::ibv_qp_cap {
-                max_send_wr: config.send_depth,
-                max_recv_wr: config.receive_depth,
+                max_send_wr: send_depth,
+                max_recv_wr: receive_depth,
                 max_send_sge: 1,
                 max_recv_sge: 1,
                 ..Default::default()
@@ -55,8 +84,8 @@ impl Native {
         Ok((
             qp,
             qpn,
-            init.cap.max_send_wr >= config.send_depth
-                && init.cap.max_recv_wr >= config.receive_depth
+            init.cap.max_send_wr >= send_depth
+                && init.cap.max_recv_wr >= receive_depth
                 && init.cap.max_send_sge >= 1
                 && init.cap.max_recv_sge >= 1,
         ))
@@ -73,11 +102,11 @@ impl Native {
             (self.ibv_modify_qp)(qp.0.as_ptr(), &mut attr, mask as c_int)
         })
     }
-    pub(crate) fn init(&self, qp: Qp, port: u8) -> RdmaResult<()> {
+    pub(crate) fn init(&self, qp: Qp, port: u8, access: u32) -> RdmaResult<()> {
         let attr = ffi::ibv_qp_attr {
             qp_state: ffi::IBV_QPS_INIT,
             port_num: port,
-            qp_access_flags: ffi::IBV_ACCESS_REMOTE_READ | ffi::IBV_ACCESS_REMOTE_WRITE,
+            qp_access_flags: access,
             ..Default::default()
         };
         self.modify(
@@ -90,29 +119,25 @@ impl Native {
             "ibv_modify_qp INIT",
         )
     }
-    pub(crate) fn connect(
-        &self,
-        qp: Qp,
-        port: Port,
-        local: &ConnectionParams,
-        peer: &ConnectionParams,
-    ) -> RdmaResult<()> {
+    pub(crate) fn connect(&self, qp: Qp, path: RcPath) -> RdmaResult<()> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::IBV_QPS_RTR,
-            path_mtu: u32::from(local.mtu.min(peer.mtu)),
-            dest_qp_num: peer.qpn,
-            rq_psn: peer.psn,
-            max_dest_rd_atomic: local.responder_depth.min(peer.initiator_depth),
+            path_mtu: u32::from(path.mtu),
+            dest_qp_num: path.remote_qpn,
+            rq_psn: path.remote_psn,
+            max_dest_rd_atomic: path.responder,
             min_rnr_timer: 12,
             ..Default::default()
         };
-        attr.ah_attr.port_num = port.number;
-        attr.ah_attr.dlid = peer.lid;
-        if port.link != crate::Link::InfiniBand || peer.gid != [0; 16] {
+        attr.ah_attr.port_num = path.port;
+        attr.ah_attr.sl = path.service_level;
+        attr.ah_attr.dlid = path.lid;
+        if path.global {
             attr.ah_attr.is_global = 1;
-            attr.ah_attr.grh.dgid.raw = peer.gid;
-            attr.ah_attr.grh.sgid_index = port.gid_index;
-            attr.ah_attr.grh.hop_limit = 64;
+            attr.ah_attr.grh.dgid.raw = path.gid;
+            attr.ah_attr.grh.sgid_index = path.gid_index;
+            attr.ah_attr.grh.hop_limit = path.hop_limit;
+            attr.ah_attr.grh.traffic_class = path.traffic_class;
         }
         self.modify(
             qp,
@@ -131,8 +156,8 @@ impl Native {
             timeout: 14,
             retry_cnt: 7,
             rnr_retry: 7,
-            sq_psn: local.psn,
-            max_rd_atomic: local.initiator_depth.min(peer.responder_depth),
+            sq_psn: path.local_psn,
+            max_rd_atomic: path.initiator,
             ..Default::default()
         };
         self.modify(

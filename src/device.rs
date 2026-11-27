@@ -1,7 +1,7 @@
 //! Selected port and protection domain. Descendants keep the actual domain alive.
+use crate::keys::KeyHistory;
 use crate::resource::{Cleanup, Fault, Owner, Result};
 use crate::{Error, sys};
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -11,6 +11,17 @@ pub enum Link {
     InfiniBand,
     RoceV1,
     RoceV2,
+}
+
+impl Link {
+    /// Linux name of the selected InfiniBand or RoCE protocol.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::InfiniBand => "IB",
+            Self::RoceV1 => "RoCE v1",
+            Self::RoceV2 => "RoCE v2",
+        }
+    }
 }
 
 /// Address and active MTU observed on an explicitly selected device port.
@@ -70,11 +81,9 @@ pub(crate) enum Charge {
     Window,
     Range,
 }
-#[derive(Default)]
 struct Ledger {
     usage: Usage,
-    // Adapted from OrbiTE's keys.rs: permanent low-eight-bit tag history per PD.
-    keys: HashMap<u32, [u64; 4]>,
+    keys: KeyHistory,
 }
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -167,29 +176,9 @@ impl Domain {
     }
     pub(crate) fn burn_key(&self, seed: u32) -> Result<u32> {
         let mut ledger = lock(&self.ledger);
-        let index = seed & !255;
-        if !ledger.keys.contains_key(&index) {
-            if ledger.keys.len() >= self.limits.key_indices {
-                return Err(Error::Exhausted("window key indices"));
-            }
-            ledger
-                .keys
-                .try_reserve(1)
-                .map_err(|_| Error::Exhausted("window key history"))?;
-            ledger.usage.key_indices += 1;
-        }
-        let tags = ledger.keys.entry(index).or_default();
-        for increment in 1..=255 {
-            let tag = seed.wrapping_add(increment) & 255;
-            let key = index | tag;
-            let bit = 1u64 << (tag % 64);
-            let word = &mut tags[(tag / 64) as usize];
-            if key != 0 && *word & bit == 0 {
-                *word |= bit;
-                return Ok(key);
-            }
-        }
-        Err(Error::Exhausted("window key tags"))
+        let key = ledger.keys.burn(seed);
+        ledger.usage.key_indices = ledger.keys.len();
+        key
     }
 }
 
@@ -231,7 +220,10 @@ impl Device {
                 caps,
                 port,
                 limits,
-                ledger: Arc::default(),
+                ledger: Arc::new(Mutex::new(Ledger {
+                    usage: Usage::default(),
+                    keys: KeyHistory::new(limits.key_indices),
+                })),
             })),
         })
     }

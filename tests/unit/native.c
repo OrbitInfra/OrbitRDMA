@@ -58,3 +58,8 @@ void ibv_ack_async_event(struct ibv_async_event *e) { (void)e; }
 #ifdef ORBITRDMA_OPTIONAL_VERBS
 int ibv_query_port_speed(struct ibv_context *c, uint32_t p, uint64_t *speed) { (void)c; (void)p; *speed = 2000; return 0; }
 #endif
+
+#ifdef ORBITRDMA_OPTIONAL_VERBS
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *p, uint64_t o, size_t n, uint64_t a, int fd, int f) { (void)p; (void)o; (void)n; (void)a; (void)fd; (void)f; return NULL; }
+
+#endif
