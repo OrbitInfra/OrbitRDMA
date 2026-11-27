@@ -119,6 +119,18 @@ impl Windows {
             _ => Err(Error::Invalid("window completion opcode")),
         }
     }
+    /// Called only after QP RESET has removed all pending bind/invalidate WRs.
+    /// Detaching a key retains its MR, range loan and reservations until QP destroy.
+    pub(crate) fn detach(&mut self) -> std::result::Result<(), Fault> {
+        for window in self.entries.values_mut() {
+            if window.stage != Stage::Invalidated {
+                window
+                    .backing
+                    .cleanup_step(|b| b.api.free_window(&mut b.mw))?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn drain(&mut self) -> std::result::Result<(), Fault> {
         let mut first = None;
         for (_, mut window) in self.entries.drain() {

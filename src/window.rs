@@ -43,10 +43,15 @@ impl RemoteDescriptor {
             .ok_or(Error::Invalid("remote address"))
     }
 }
+enum Binding {
+    Unposted,
+    MayBeBound,
+    Invalidated,
+}
 struct WindowData {
     qp: QueuePair,
     _domain: std::sync::Arc<crate::device::Domain>,
-    bind_attempted: bool,
+    binding: Binding,
     api: &'static sys::Native,
     mw: Option<sys::Mw>,
     loan: Option<Loan>,
@@ -54,11 +59,21 @@ struct WindowData {
 }
 impl Cleanup for WindowData {
     fn cleanup(&mut self) -> std::result::Result<(), Fault> {
+        if matches!(self.binding, Binding::MayBeBound) {
+            let qp = self
+                .qp
+                .owner
+                .retained()
+                .and_then(|q| q.qp)
+                .ok_or(Fault("reset dedicated-window QP", libc::EBADF))?;
+            self.api.reset(qp)?;
+            self.api.free_window(&mut self.mw)?;
+        }
         let qp_fault = self.qp.close().err().map(|err| match err {
             Error::Unquiesced { operation, code } => Fault(operation, code),
             _ => Fault("QP retirement", libc::EIO),
         });
-        if !self.bind_attempted {
+        if matches!(self.binding, Binding::Unposted) {
             self.loan.take();
         } else if !self.qp.drained() {
             return Err(qp_fault.unwrap_or(Fault("QP drain", libc::EBUSY)));
@@ -117,7 +132,7 @@ impl QueuePair {
         let mut owner = Owner::new(WindowData {
             qp: self,
             _domain: domain,
-            bind_attempted: false,
+            binding: Binding::Unposted,
             api,
             mw: None,
             loan: Some(loan),
@@ -130,7 +145,7 @@ impl QueuePair {
             r.mw = Some(mw);
             let key = q.domain.burn_key(seed)?;
             let loan = r.loan.as_ref().ok_or(Error::Closed)?;
-            r.bind_attempted = true;
+            r.binding = Binding::MayBeBound;
             api.post_window(
                 q.qp.ok_or(Error::Closed)?,
                 key,
@@ -196,6 +211,7 @@ impl RemoteWindow {
         if !self.poll(false)? {
             return Ok(false);
         }
+        self.owner.get_mut()?.binding = Binding::Invalidated;
         self.close()?;
         Ok(true)
     }

@@ -90,17 +90,28 @@ impl Native {
                 && init.cap.max_recv_sge >= 1,
         ))
     }
+    fn modify_raw(&self, qp: Qp, mut attr: ffi::ibv_qp_attr, mask: u32) -> c_int {
+        // SAFETY: the unique queue owner selects the legal mask and serializes native changes.
+        unsafe { (self.ibv_modify_qp)(qp.0.as_ptr(), &mut attr, mask as c_int) }
+    }
     fn modify(
         &self,
         qp: Qp,
-        mut attr: ffi::ibv_qp_attr,
+        attr: ffi::ibv_qp_attr,
         mask: u32,
         op: &'static str,
     ) -> RdmaResult<()> {
-        // SAFETY: the unique queue owner selects the legal mask and serializes native changes.
-        check(op, unsafe {
-            (self.ibv_modify_qp)(qp.0.as_ptr(), &mut attr, mask as c_int)
-        })
+        check(op, self.modify_raw(qp, attr, mask))
+    }
+    pub(crate) fn reset(&self, qp: Qp) -> std::result::Result<(), Fault> {
+        let attr = ffi::ibv_qp_attr {
+            qp_state: ffi::IBV_QPS_RESET,
+            ..Default::default()
+        };
+        match self.modify_raw(qp, attr, ffi::IBV_QP_STATE) {
+            0 => Ok(()),
+            code => Err(Fault("ibv_modify_qp RESET", code)),
+        }
     }
     pub(crate) fn init(&self, qp: Qp, port: u8, access: u32) -> RdmaResult<()> {
         let attr = ffi::ibv_qp_attr {

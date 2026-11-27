@@ -60,14 +60,17 @@ fn retire(w: &mut SharedWindow, q: &mut QueuePair) -> Result<()> {
     Ok(())
 }
 
-fn serve_windows(dev: &Device, q: &mut QueuePair, control: &mut TcpStream) -> Result<()> {
-    let mut expected = [0x67; 24];
-    let mut mem = dev.register(
-        HostBuffer::from_vec(expected.to_vec())?,
+fn serve_windows(
+    dev: &Device,
+    q: &mut QueuePair,
+    control: &mut TcpStream,
+) -> Result<RegisteredMemory> {
+    let mem = dev.register(
+        HostBuffer::from_vec(vec![0x67; 24])?,
         Permissions::RemoteReadWrite,
     )?;
     let mut a = q.expose_window(&mem, 4..8, Permissions::RemoteWrite)?;
-    let mut b = q.expose_window(&mem, 12..16, Permissions::RemoteReadWrite)?;
+    let b = q.expose_window(&mem, 12..16, Permissions::RemoteReadWrite)?;
     for desc in [
         publish(&a, q, RemoteAccess::Write)?,
         publish(&b, q, RemoteAccess::Read)?,
@@ -87,14 +90,10 @@ fn serve_windows(dev: &Device, q: &mut QueuePair, control: &mut TcpStream) -> Re
     mem.write(4..8)?.copy_from_slice(b"free");
     control.write_all(b"V")?;
     receive_ack(control, b'D')?;
-    retire(&mut b, q)?;
-    expected[4..8].copy_from_slice(b"free");
-    expected[12..16].copy_from_slice(b"next");
-    if mem.deregister()?.as_ref() != expected {
-        return Err("window payload or guard mismatch".into());
-    }
+    // B's key stays bound after its token goes out of scope. The same QP will
+    // carry SEND/RECV and then close with B still attached.
     control.write_all(b"V")?;
-    Ok(())
+    Ok(mem)
 }
 
 fn transfer(q: &mut QueuePair, mem: &RegisteredMemory, remote: RemoteDescriptor) -> Result<()> {
@@ -210,16 +209,30 @@ fn main() -> Result<()> {
     )?;
     let mut qp = connect(&dev, &mut control)?;
     let qpn = qp.parameters().qpn;
-    if server {
-        serve_windows(&dev, &mut qp, &mut control)?;
+    let server_memory = if server {
+        Some(serve_windows(&dev, &mut qp, &mut control)?)
     } else {
         access_windows(&dev, &mut qp, &mut control)?;
-    }
+        None
+    };
     send_receive(&dev, &mut qp, &mut control, server)?;
+    if let Some(mem) = &server_memory {
+        if !matches!(mem.write(12..16), Err(orbit_rdma::Error::Busy)) {
+            return Err("dropping B's token released its bytes before close".into());
+        }
+    }
     qp.close()?;
+    if let Some(mut mem) = server_memory {
+        let mut expected = [0x67; 24];
+        expected[4..8].copy_from_slice(b"free");
+        expected[12..16].copy_from_slice(b"next");
+        if mem.deregister()?.as_ref() != expected {
+            return Err("window payload or guard mismatch after closing with B bound".into());
+        }
+    }
     dev.close()?;
     println!(
-        "Verified two windows on one QP {qpn}, READ/WRITE on B after revoking A, SEND/RECV and guard bytes on {device} ({role})."
+        "Verified two windows on one QP {qpn}, READ/WRITE on B after revoking A, SEND/RECV, close with B still bound and guard bytes on {device} ({role})."
     );
     Ok(())
 }

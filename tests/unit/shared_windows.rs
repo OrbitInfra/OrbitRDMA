@@ -159,8 +159,9 @@ fn uncertain_invalidation_and_failed_drain_hold_the_actual_backing() {
                     p.count("free_mw"),
                     p.count("free_mr")
                 ),
-                (1, 1, 0, 0)
+                (1, 1, 2, 0)
             );
+            assert_eq!(p.count("reset"), 1);
             let u = d.usage().unwrap();
             assert_eq!((u.regions, u.windows, u.registered_bytes), (3, 2, 32));
         },
@@ -479,4 +480,100 @@ fn overlapping_read_only_windows_retire_independently() {
         assert!(b.revoke(&mut q).unwrap());
         assert!(mr.write(0..12).is_ok());
     });
+}
+
+#[test]
+fn close_removes_pending_control_work_before_detaching_each_key() {
+    case(
+        "close_removes_pending_control_work_before_detaching_each_key",
+        |p| {
+            let d = device();
+            let mut q = conn(&d);
+            let mut mr = d.register(bytes(16), Permissions::RemoteWrite).unwrap();
+            let mut a = q
+                .expose_window(&mr, 0..8, Permissions::RemoteWrite)
+                .unwrap();
+            assert!(a.descriptor(&mut q, RemoteAccess::Write).unwrap().is_some());
+            p.option("delay");
+            let _b = q
+                .expose_window(&mr, 8..16, Permissions::RemoteWrite)
+                .unwrap();
+            assert!(!a.revoke(&mut q).unwrap());
+            let before = p.events().len();
+            q.close().unwrap(); // BIND B and LOCAL_INV A have no observable completions.
+            super::events(
+                p,
+                before,
+                &[
+                    "reset",
+                    "free_mw",
+                    "free_mw",
+                    "free_qp",
+                    "free_mr",
+                    "free_mr",
+                    "free_cq",
+                    "free_channel",
+                ],
+            );
+            let bytes = mr.deregister().unwrap();
+            assert_eq!((bytes.as_ref()[7], bytes.as_ref()[15]), (0xa5, 0xa5));
+            let u = d.usage().unwrap();
+            assert_eq!(
+                (u.queue_pairs, u.regions, u.windows, u.range_loans),
+                (0, 0, 0, 0)
+            );
+        },
+    );
+}
+
+#[test]
+fn failed_close_reset_or_window_detach_keeps_all_backing_and_payload() {
+    case(
+        "failed_close_reset_or_window_detach_keeps_all_backing_and_payload",
+        |p| {
+            for (step, name) in [
+                ("reset", "ibv_modify_qp RESET"),
+                ("free_mw", "ibv_dealloc_mw"),
+            ] {
+                let d = device();
+                let mut q = conn(&d);
+                let (buf, dropped) = external(24);
+                let mut mr = d.register(buf, Permissions::RemoteWrite).unwrap();
+                let a = q
+                    .expose_window(&mr, 0..8, Permissions::RemoteWrite)
+                    .unwrap();
+                assert!(a.descriptor(&mut q, RemoteAccess::Write).unwrap().is_some());
+                let _b = q
+                    .expose_window(&mr, 8..16, Permissions::RemoteWrite)
+                    .unwrap();
+                let req = Request::new(mr.range(16..24).unwrap(), Transfer::Receive);
+                let op = q.submit(vec![req]).unwrap().operations.pop().unwrap();
+                let qp_destroys = p.count("free_qp");
+                let mr_destroys = p.count("free_mr");
+                let attempts = p.count(step);
+                p.fault(step, "");
+                cleanup(q.close().unwrap_err(), name);
+                p.fault("", "");
+                cleanup(q.close().unwrap_err(), name);
+                assert_eq!(p.count(step), attempts + 1);
+                assert_eq!(
+                    (p.count("free_qp"), p.count("free_mr")),
+                    (qp_destroys, mr_destroys)
+                );
+                assert!(matches!(op.try_reclaim(), Reclaim::Unquiesced { .. }));
+                for r in [0..8, 8..16, 16..24] {
+                    assert!(matches!(mr.write(r), Err(Error::Busy)));
+                }
+                assert!(matches!(mr.deregister(), Err(Error::Busy)));
+                drop(q);
+                drop(mr);
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                let u = d.usage().unwrap();
+                assert_eq!(
+                    (u.windows, u.regions, u.registered_bytes, u.in_flight_bytes),
+                    (2, 3, 40, 8)
+                );
+            }
+        },
+    );
 }

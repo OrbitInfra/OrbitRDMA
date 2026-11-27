@@ -62,9 +62,23 @@ pub(crate) struct QueueData {
     pub windows: crate::window::Windows,
     _permit: Permit,
 }
+impl QueueData {
+    fn destroy_qp(&mut self) -> std::result::Result<(), Fault> {
+        if !self.windows.is_empty() {
+            // RESET removes outstanding local WRs, including a delayed or uncertain
+            // bind. RXE can reject QP destruction while a type-2 MW is still bound.
+            self.api.reset(
+                self.qp
+                    .ok_or(Fault("reset shared-window QP", libc::EBADF))?,
+            )?;
+            self.windows.detach()?;
+        }
+        sys::destroy(&mut self.qp, "ibv_destroy_qp", self.api.ibv_destroy_qp)
+    }
+}
 impl Cleanup for QueueData {
     fn cleanup(&mut self) -> std::result::Result<(), Fault> {
-        if let Err(fault) = sys::destroy(&mut self.qp, "ibv_destroy_qp", self.api.ibv_destroy_qp) {
+        if let Err(fault) = self.destroy_qp() {
             self.payload.quarantine(fault);
             return Err(fault);
         }
@@ -219,7 +233,10 @@ impl QueuePair {
     pub(crate) fn drained(&self) -> bool {
         self.owner.retained().is_none_or(|r| r.qp.is_none())
     }
-    /// Destroys the QP, CQ and channel in that order. A failed destroy is terminal.
+    /// Retires remaining grants, the QP, CQ and completion channel. With live
+    /// windows it resets the QP and detaches their keys before destroying the QP.
+    /// The backing stays held through QP destruction and MR deregistration.
+    /// A failed native teardown step is terminal.
     pub fn close(&mut self) -> Result<()> {
         self.owner.release().map(drop)
     }

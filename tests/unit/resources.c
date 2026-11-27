@@ -34,6 +34,7 @@ struct test_qp {
 struct test_mr {
     struct ibv_mr mr;
     uint8_t *late;
+    struct test_qp *late_qp;
     struct test_mr *next;
 };
 struct test_mw {
@@ -44,7 +45,8 @@ struct test_mw {
     uint64_t address, length;
     uint32_t key, access;
     uint8_t *late;
-    int valid;
+    uint64_t control_id;
+    int valid, control_pending;
 };
 static struct test_qp *all_qps;
 static struct test_mr *all_mrs;
@@ -108,12 +110,16 @@ static int free_mw(struct ibv_mw *mw) {
     if (event("free_mw"))
         return EIO;
     struct test_mw *w = (struct test_mw *)mw;
+    if (w->control_pending) return EBUSY;
     struct test_mw **it = &all_mws;
     while (*it && *it != w) it = &(*it)->next;
     if (!*it) return EINVAL;
     *it = w->next;
     /* Model a previously translated WRITE that still holds the target MR. */
-    if (w->late) w->mr->late = w->late;
+    if (w->late) {
+        w->mr->late = w->late;
+        w->mr->late_qp = w->qp;
+    }
     free(w);
     return 0;
 }
@@ -129,6 +135,7 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
         *bad = wr;
         return ENOMEM;
     }
+    struct test_mw *w;
     if (bind) {
         struct ibv_mw_bind_info *info = &wr->bind_mw.bind_info;
         struct ibv_mr *mr = info->mr;
@@ -139,7 +146,7 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
             !(info->mw_access_flags & (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)) ||
             (info->mw_access_flags & ~(IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)))
             return EINVAL;
-        struct test_mw *w = (struct test_mw *)wr->bind_mw.mw;
+        w = (struct test_mw *)wr->bind_mw.mw;
         w->valid = 1;
         w->qp = q;
         w->mr = (struct test_mr *)mr;
@@ -150,10 +157,12 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
         if (w->access & IBV_ACCESS_REMOTE_WRITE)
             w->late = (uint8_t *)(uintptr_t)(w->address + w->length - 1);
     } else {
-        struct test_mw *w = window_for(base->qp_num, wr->invalidate_rkey);
+        w = window_for(base->qp_num, wr->invalidate_rkey);
         if (!w) return EINVAL;
         w->valid = 0;
     }
+    w->control_id = wr->wr_id;
+    w->control_pending = 1;
     struct ibv_wc wc = {.wr_id = wr->wr_id,
                         .qp_num = base->qp_num,
                         .status = IBV_WC_SUCCESS,
@@ -175,6 +184,9 @@ static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
     *wc = cq->data[cq->head++ % 256];
     --cq->count;
     if (wc->opcode != IBV_WC_BIND_MW && wc->opcode != IBV_WC_LOCAL_INV) return 1;
+    for (struct test_mw *w = all_mws; w; w = w->next)
+        if (w->qp && w->qp->qp.qp_num == wc->qp_num && w->control_id == wc->wr_id)
+            w->control_pending = 0;
     if (is("foreign_id"))
         ++wc->wr_id;
     if (is("foreign_qp"))
@@ -420,6 +432,15 @@ unsigned orbit_attr(int n) {
 int ibv_modify_qp(struct ibv_qp *base, struct ibv_qp_attr *a, int mask) {
     struct test_qp *q = (struct test_qp *)base;
     switch (a->qp_state) {
+    case IBV_QPS_RESET:
+        if (event("reset")) return EIO;
+        if (mask != IBV_QP_STATE) return EINVAL;
+        q->stage = 0;
+        ((struct test_cq *)base->send_cq)->count = 0;
+        ((struct test_cq *)base->recv_cq)->count = 0;
+        for (struct test_mw *w = all_mws; w; w = w->next)
+            if (w->qp == q) w->control_pending = 0;
+        return 0;
     case IBV_QPS_INIT:
         if (event("init"))
             return EIO;
@@ -461,7 +482,17 @@ int ibv_destroy_qp(struct ibv_qp *base) {
     if (event("free_qp"))
         return EIO;
     struct test_qp *q = (struct test_qp *)base;
-    /* An earlier accepted remote WRITE becomes visible only at physical drain. */
+    /* RXE refuses to destroy a QP with any type-2 MW still bound. */
+    for (struct test_mw *w = all_mws; w; w = w->next)
+        if (w->qp == q && w->valid) return EBUSY;
+    /* Previously translated DMA can finish at QP destruction or MR deregistration. */
+    for (struct test_mr *m = all_mrs; m; m = m->next) {
+        if (m->late && m->late_qp == q) {
+            *m->late = 0xa5;
+            m->late = NULL;
+            m->late_qp = NULL;
+        }
+    }
     if (q->deferred_receive) {
         for (unsigned i = 0; i < q->nrecv; ++i) {
             struct ibv_sge *s = &q->receives[i].sge;
@@ -481,6 +512,7 @@ int ibv_destroy_qp(struct ibv_qp *base) {
         if (w->late) *w->late = 0xa5;
         w->late = NULL;
         w->valid = 0;
+        w->control_pending = 0;
         w->qp = NULL;
     }
     free(q);
