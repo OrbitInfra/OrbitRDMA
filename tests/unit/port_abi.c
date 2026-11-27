@@ -30,7 +30,9 @@ void *orbite_test_context(int mode) {
     context.sz = sizeof(context);
     context.context.abi_compat = mode == 3 ? NULL : __VERBS_ABI_IS_EXTENDED;
     context.context.num_comp_vectors = mode;
-    context.query_port = query;
+    context.query_port = mode == 4 ? NULL : query;
+    if (mode == 5)
+        context.sz = sizeof(context) - offsetof(struct verbs_context, query_port) - 1;
     return &context.context;
 }
 
@@ -49,3 +51,23 @@ int orbite_test_legacy_query(struct ibv_context *context, uint8_t port,
                             struct _compat_ibv_port_attr *attr) {
     return query(context, port, (struct ibv_port_attr *)attr, sizeof(struct ibv_port_attr));
 }
+
+#if defined(ORBIT_TEST_MLX5) && __has_include(<infiniband/mlx5dv.h>)
+#include <infiniband/mlx5dv.h>
+int orbit_has_mlx5_pd(void) { return 1; }
+
+int orbit_test_mlx5_init(void *data, uint64_t type) {
+    struct mlx5dv_obj *object = data;
+    if (type != MLX5DV_OBJ_PD || !object->pd.in || !object->pd.out)
+        return EINVAL;
+    object->pd.out->pdn = 0x123456;
+    return 0;
+}
+#elif defined(ORBIT_TEST_MLX5)
+int orbit_has_mlx5_pd(void) { return 0; }
+int orbit_test_mlx5_init(void *data, uint64_t type) {
+    (void)data;
+    (void)type;
+    return EOPNOTSUPP;
+}
+#endif

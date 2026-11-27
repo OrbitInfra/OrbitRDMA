@@ -13,18 +13,21 @@ pub struct PortAttributes {
 unsafe fn query_with(
     context: *mut ffi::ibv_context,
     port: u8,
-    legacy: Option<
-        unsafe extern "C" fn(*mut ffi::ibv_context, u8, *mut ffi::_compat_ibv_port_attr) -> c_int,
-    >,
+    legacy: Option<crate::sys::port::LegacyQuery>,
 ) -> Result<PortAttributes, c_int> {
     let mut a = ffi::ibv_port_attr::default();
-    // SAFETY: the caller retains the context, and the C bridge and this output use the same headers.
-    let code = unsafe { crate::sys::ffi::orbit_query_port(context, port, &mut a, legacy) };
+    // SAFETY: the caller retains the live context, provider and optional legacy callback.
+    let code = unsafe { crate::sys::port::query(context, port, &mut a, legacy) };
     if code != 0 {
         return Err(code);
     }
-    // SAFETY: a was initialized by the provider using its supported layout.
-    let active_speed = unsafe { crate::sys::ffi::orbit_port_speed_bits(&a) };
+    let active_speed = u32::from(a.active_speed);
+    #[cfg(orbit_active_speed_ex)]
+    let active_speed = if a.active_speed_ex != 0 {
+        a.active_speed_ex
+    } else {
+        active_speed
+    };
     Ok(PortAttributes {
         state: a.state,
         active_mtu: a.active_mtu,

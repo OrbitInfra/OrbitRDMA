@@ -13,6 +13,7 @@ use crate::LoadError;
 
 mod device;
 mod memory;
+pub(crate) mod port;
 mod queue;
 pub(crate) mod transfer;
 pub(crate) use device::{Caps, Context, Pd};

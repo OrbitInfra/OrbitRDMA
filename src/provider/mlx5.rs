@@ -48,8 +48,26 @@ impl Driver {
             .as_ref()
     }
 }
-unsafe extern "C" {
-    fn orbit_mlx5_pdn(init: Init, pd: *mut c_void, pdn: *mut u32) -> c_int;
+#[cfg(orbit_mlx5dv_pd)]
+pub(super) unsafe fn pd_number(init: Init, pd: *mut c_void) -> Option<u32> {
+    use crate::sys::ffi::{MLX5DV_OBJ_PD, mlx5dv_obj, mlx5dv_pd};
+    let mut result = mlx5dv_pd::default();
+    let mut object = mlx5dv_obj::default();
+    object.pd.in_ = pd.cast();
+    object.pd.out = &mut result;
+    // SAFETY: the caller retains the PD and driver. Both objects use the installed mlx5dv layout.
+    let rc = unsafe {
+        init(
+            std::ptr::from_mut(&mut object).cast(),
+            u64::from(MLX5DV_OBJ_PD),
+        )
+    };
+    (rc == 0).then_some(result.pdn)
+}
+
+#[cfg(not(orbit_mlx5dv_pd))]
+pub(super) unsafe fn pd_number(_init: Init, _pd: *mut c_void) -> Option<u32> {
+    None
 }
 
 /// Try to open a DevX-enabled context for a supported mlx5 device.
@@ -125,10 +143,13 @@ pub unsafe fn caps(h: &DeviceHandles) -> GpuKeyRange {
     {
         return caps;
     }
-    // SAFETY: the optional header shim supplies the provider object layout for this PD.
-    if unsafe { orbit_mlx5_pdn(d.init, h.pd, &mut caps.pdn) } == 0 && caps.pdn <= 0xff_ffff {
-        caps.base = base;
-        caps.count = count;
+    // SAFETY: the caller keeps this driver's protection domain live.
+    if let Some(pdn) = unsafe { pd_number(d.init, h.pd) } {
+        caps.pdn = pdn;
+        if pdn <= 0xff_ffff {
+            caps.base = base;
+            caps.count = count;
+        }
     }
     caps
 }

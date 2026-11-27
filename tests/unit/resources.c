@@ -321,13 +321,19 @@ struct ibv_comp_channel *ibv_create_comp_channel(struct ibv_context *c) {
     h->base.context = c;
     h->base.fd = fds[0];
     h->tx = fds[1];
+    if (is("event_error_only") || is("event_error_again")) {
+        close(fds[0]);
+        h->base.fd = fds[1]; /* The orphaned write end polls with EPOLLERR alone. */
+        h->tx = -1;
+    }
     return &h->base;
 }
 int ibv_destroy_comp_channel(struct ibv_comp_channel *h) {
     if (event("free_channel"))
         return EIO;
     close(h->fd);
-    close(((struct test_channel *)h)->tx);
+    if (((struct test_channel *)h)->tx >= 0)
+        close(((struct test_channel *)h)->tx);
     free(h);
     return 0;
 }
@@ -532,6 +538,10 @@ int ibv_get_cq_event(struct ibv_comp_channel *h, struct ibv_cq **q, void **v) {
     }
     struct test_channel *ch = (struct test_channel *)h;
     char token;
+    if (is("event_error_again")) {
+        errno = EAGAIN;
+        return -1;
+    }
     if (read(h->fd, &token, 1) != 1)
         return -1;
     *q = &ch->cq->cq;

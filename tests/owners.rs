@@ -1,3 +1,6 @@
+#[cfg(feature = "tokio")]
+#[path = "unit/async_progress.rs"]
+mod async_progress;
 #[path = "support/provider.rs"]
 mod provider;
 #[path = "unit/shared_windows.rs"]

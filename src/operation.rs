@@ -9,6 +9,8 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "tokio")]
+pub(crate) mod notification;
 mod queue;
 pub(crate) use queue::{PayloadQueue, reserve_ids};
 
@@ -177,23 +179,28 @@ impl Operation {
     /// Drives this operation's CQ. False means the deadline elapsed while the range was still held.
     pub fn wait_until(&self, queue: &mut QueuePair, deadline: Instant) -> Result<bool, Error> {
         loop {
-            {
-                let s = lock(&self.state);
-                if let Some(fault) = s.quarantine {
-                    return Err(fault.unquiesced());
-                }
-                if s.retired {
-                    return Ok(true);
-                }
-            }
-            if !queue.connected()?.payload.contains(self.id) {
-                return Err(Error::Invalid("operation belongs to another QP"));
+            if self.retired_on(queue)? {
+                return Ok(true);
             }
             let progressed = queue.wait_for_progress(deadline)?;
             if progressed == 0 && Instant::now() >= deadline {
                 return Ok(self.is_reusable());
             }
         }
+    }
+    fn retired_on(&self, queue: &QueuePair) -> Result<bool, Error> {
+        let state = lock(&self.state);
+        if let Some(fault) = state.quarantine {
+            return Err(fault.unquiesced());
+        }
+        if state.retired {
+            return Ok(true);
+        }
+        drop(state);
+        if !queue.connected()?.payload.contains(self.id) {
+            return Err(Error::Invalid("operation belongs to another QP"));
+        }
+        Ok(false)
     }
     /// Returns the original range only after its DMA loan and physical credits were released.
     pub fn try_reclaim(self) -> Reclaim {

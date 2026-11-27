@@ -60,6 +60,8 @@ pub(crate) struct QueueData {
     pub channel: Option<sys::Channel>,
     pub payload: crate::operation::PayloadQueue,
     pub windows: crate::window::Windows,
+    #[cfg(feature = "tokio")]
+    pub notifier: Option<crate::operation::notification::Notifier>,
     _permit: Permit,
 }
 impl QueueData {
@@ -78,6 +80,8 @@ impl QueueData {
 }
 impl Cleanup for QueueData {
     fn cleanup(&mut self) -> std::result::Result<(), Fault> {
+        #[cfg(feature = "tokio")]
+        self.notifier.take();
         if let Err(fault) = self.destroy_qp() {
             self.payload.quarantine(fault);
             return Err(fault);
@@ -131,6 +135,8 @@ impl Device {
             channel: None,
             payload: crate::operation::PayloadQueue::new(config),
             windows: Default::default(),
+            #[cfg(feature = "tokio")]
+            notifier: None,
             _permit: domain.reserve(Charge::Queue)?,
         });
         let create = (|| {
@@ -188,10 +194,8 @@ impl QueuePair {
     /// }
     /// ```
     pub fn connect(&mut self, peer: &ConnectionParams) -> Result<()> {
+        self.unconnected()?;
         let data = self.owner.get()?;
-        if self.peer.is_some() {
-            return Err(Error::Invalid("QP is already connected"));
-        }
         peer.validate(self.local.link)?;
         let port = data.domain.port;
         let (_, ctx, _) = data.domain.native()?;
@@ -221,6 +225,13 @@ impl QueuePair {
             return Err(self.owner.rollback(e));
         }
         self.peer = Some(*peer);
+        Ok(())
+    }
+    pub(crate) fn unconnected(&self) -> Result<()> {
+        self.owner.get()?;
+        if self.peer.is_some() {
+            return Err(Error::Invalid("QP is already connected"));
+        }
         Ok(())
     }
     pub(crate) fn connected(&self) -> Result<&QueueData> {

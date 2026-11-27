@@ -1,9 +1,8 @@
 //! Two-process host-memory check. TCP exchanges only connection parameters,
 //! window descriptors and phase acknowledgements. Each payload is a verbs WR.
+#![forbid(unsafe_code)]
 mod completion;
-mod host_peer_wire;
 use completion::{deadline, finish};
-use host_peer_wire::{field, read_params, read_window, send_params, send_window};
 use orbit_rdma::{
     Device, HostBuffer, Limits, Permissions, QueueConfig, QueuePair, RegisteredMemory,
     RemoteAccess, RemoteDescriptor, Request, SharedWindow, Transfer,
@@ -12,12 +11,18 @@ use std::{
     env,
     error::Error,
     ffi::OsStr,
-    io::Write,
+    io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+fn field<const N: usize>(stream: &mut impl Read) -> io::Result<[u8; N]> {
+    let mut bytes = [0; N];
+    stream.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
 
 fn receive_ack(control: &mut TcpStream, expected: u8) -> Result<()> {
     if field::<1>(control)? != [expected] {
@@ -31,8 +36,7 @@ fn connect(dev: &Device, control: &mut TcpStream) -> Result<QueuePair> {
     let mut random = std::fs::File::open("/dev/urandom")?;
     let psn = u32::from_be_bytes(field(&mut random)?) & 0xff_ffff;
     let mut qp = dev.queue_pair(QueueConfig::new(psn))?;
-    send_params(control, qp.parameters())?;
-    qp.connect(&read_params(control)?)?;
+    qp.connect_over(control)?;
     Ok(qp)
 }
 
@@ -76,7 +80,7 @@ fn serve_windows(
         publish(&b, q, RemoteAccess::Read)?,
         publish(&b, q, RemoteAccess::Write)?,
     ] {
-        send_window(control, desc)?;
+        control.write_all(&desc.to_bytes())?;
     }
     receive_ack(control, b'D')?;
     retire(&mut a, q)?;
@@ -109,9 +113,9 @@ fn transfer(q: &mut QueuePair, mem: &RegisteredMemory, remote: RemoteDescriptor)
 
 fn access_windows(dev: &Device, q: &mut QueuePair, control: &mut TcpStream) -> Result<()> {
     let (a, b_read, b_write) = (
-        read_window(control)?,
-        read_window(control)?,
-        read_window(control)?,
+        RemoteDescriptor::from_bytes(field(control)?)?,
+        RemoteDescriptor::from_bytes(field(control)?)?,
+        RemoteDescriptor::from_bytes(field(control)?)?,
     );
     if a.qpn != b_read.qpn
         || a.qpn != b_write.qpn
