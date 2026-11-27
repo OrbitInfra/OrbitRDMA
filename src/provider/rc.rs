@@ -94,3 +94,20 @@ pub unsafe extern "C" fn connect(
     )
     .map_or_else(provider_errno, |()| 0)
 }
+
+/// Reset a terminal shared-window QP before detaching still-bound MWs.
+/// Keep each private MR and its backing until all dependencies have retired.
+///
+/// # Safety
+/// The caller has fenced this live QP and all affiliated submitters. After a
+/// failed reset retain the QP, all attached windows and their registrations.
+pub unsafe extern "C" fn reset_qp(h: *mut ConnectionHandles) -> c_int {
+    let Ok(api) = crate::sys::get() else {
+        return libc::ENOSYS;
+    };
+    // SAFETY: this exclusive connection remains live through the transition.
+    match unsafe { crate::sys::Qp::borrowed((*h).qp) } {
+        Ok(qp) => api.reset(qp).map_or_else(|fault| fault.1, |()| 0),
+        Err(code) => code,
+    }
+}
