@@ -118,10 +118,10 @@ mod tests {
             2,
         )
         .unwrap();
-        assert!(h.claim_exact(21 << 8 | 1).unwrap());
+        assert!(h.claim_exact((21 << 8) | 1).unwrap());
         assert_eq!(a.claim(&mut h, 1).unwrap(), None);
-        assert_eq!(a.claim(&mut h, 1).unwrap(), Some(20 << 8 | 1));
-        assert_eq!(a.claim(&mut h, 1).unwrap(), Some(21 << 8 | 2));
+        assert_eq!(a.claim(&mut h, 1).unwrap(), Some((20 << 8) | 1));
+        assert_eq!(a.claim(&mut h, 1).unwrap(), Some((21 << 8) | 2));
         let mut count = 0;
         while a.claim(&mut h, 1).unwrap().is_some() {
             count += 1;
