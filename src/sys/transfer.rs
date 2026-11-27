@@ -447,8 +447,12 @@ fn decode_entry(wc: &ffi::ibv_wc, datagram: bool) -> CompletionEntry {
         None
     };
     CompletionEntry {
-        source_qp: (datagram && wc.status == ffi::IBV_WC_SUCCESS && wc.opcode == ffi::IBV_WC_RECV)
-            .then(|| wc.src_qp),
+        source_qp: if datagram && wc.status == ffi::IBV_WC_SUCCESS && wc.opcode == ffi::IBV_WC_RECV
+        {
+            Some(wc.src_qp)
+        } else {
+            None
+        },
         work: decode(wc),
         immediate,
     }
