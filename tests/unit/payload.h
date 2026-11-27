@@ -81,10 +81,15 @@ static int data_recv(struct ibv_qp *base, struct ibv_recv_wr *wr, struct ibv_rec
             *bad = bad_style == 1 ? NULL : bad_style == 2 ? &foreign : wr;
             return bad_style == 3 ? 0 : ENOMEM;
         }
-        if (q->stage != 3 || wr->num_sge != 1 || !valid_sge(q, wr->sg_list) || q->nrecv >= 128) {
+        if (q->stage != 3 || wr->num_sge < 1 || wr->num_sge > 8 || !valid_sge(q, wr->sg_list) || q->nrecv >= 128) {
             *bad = wr;
             return EINVAL;
         }
+        for (int i = 0; i < wr->num_sge; ++i) if (!valid_sge(q, &wr->sg_list[i])) {
+            *bad = wr; return EINVAL;
+        }
+        /* Multi-SGE byte movement is tested with RXE. This CPU mode injects CQEs. */
+        if (wr->num_sge > 1 && !is("manual")) { *bad = wr; return EOPNOTSUPP; }
         event("rq_wr");
         cq->last = (struct ibv_wc){.wr_id = wr->wr_id,
                                    .qp_num = base->qp_num,
@@ -123,19 +128,35 @@ static int data_send(struct test_qp *q, struct ibv_send_wr *wr, struct ibv_send_
             return bad_style == 3 ? 0 : ENOMEM;
         }
         struct ibv_sge *s = wr->sg_list;
-        if (q->stage != 3 || wr->num_sge != 1 || !valid_sge(q, s) ||
+        if (q->stage != 3 || wr->num_sge < 1 || wr->num_sge > 8 || !valid_sge(q, s) ||
             (wr->send_flags & ~(IBV_SEND_SIGNALED | IBV_SEND_FENCE))) {
             *bad = wr;
             return EINVAL;
         }
+        for (int i = 0; i < wr->num_sge; ++i) if (!valid_sge(q, &wr->sg_list[i])) {
+            *bad = wr; return EINVAL;
+        }
+        if (wr->num_sge > 1 && !is("manual")) { *bad = wr; return EOPNOTSUPP; }
         enum ibv_wc_opcode opcode;
         switch (wr->opcode) {
+        case IBV_WR_ATOMIC_FETCH_AND_ADD:
+            if (!is("manual")) { *bad = wr; return EOPNOTSUPP; }
+            opcode = IBV_WC_FETCH_ADD; break;
+        case IBV_WR_ATOMIC_CMP_AND_SWP:
+            if (!is("manual")) { *bad = wr; return EOPNOTSUPP; }
+            opcode = IBV_WC_COMP_SWAP; break;
+        case IBV_WR_SEND_WITH_IMM:
+            if (!is("manual")) { *bad = wr; return EOPNOTSUPP; }
+            /* fall through */
         case IBV_WR_SEND:
             opcode = IBV_WC_SEND;
             break;
         case IBV_WR_RDMA_READ:
             opcode = IBV_WC_RDMA_READ;
             break;
+        case IBV_WR_RDMA_WRITE_WITH_IMM:
+            if (!is("manual")) { *bad = wr; return EOPNOTSUPP; }
+            /* fall through */
         case IBV_WR_RDMA_WRITE:
             opcode = IBV_WC_RDMA_WRITE;
             break;

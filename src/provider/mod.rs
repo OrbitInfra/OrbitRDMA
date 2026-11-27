@@ -4,7 +4,9 @@
 #![allow(unsafe_code)]
 use std::ffi::{CStr, c_char, c_int, c_void};
 pub mod abi;
+mod accounting;
 use abi as ffi;
+pub use accounting::{NamedKeyCursor, WorkNamespaces};
 mod cq;
 mod device;
 pub mod inventory;

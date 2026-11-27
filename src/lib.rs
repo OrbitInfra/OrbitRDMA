@@ -33,20 +33,27 @@ mod sys;
 mod window;
 
 #[cfg(target_os = "linux")]
-pub use device::{Device, Limits, Link, Port, Usage};
+pub use device::{Device, Limits, Link, Port, SharedQueueUsage, Usage};
 #[cfg(target_os = "linux")]
 pub use memory::{
     HostBuffer, Permissions, ReadRange, RegisteredMemory, RegisteredRange, WriteRange,
 };
 #[cfg(target_os = "linux")]
 pub use operation::{
-    Completion, Operation, Outcome, PostStatus, Reclaim, Rejected, RejectedOne, Request,
-    SingleSubmission, Submission, Transfer, TransferFailure,
+    Completion, DatagramAddress, DatagramQueue, DatagramReceipt, Immediate, Operation, Outcome,
+    PostStatus, Reclaim, Rejected, RejectedOne, Request, SharedReceiveQueue, SingleSubmission,
+    Submission, Transfer, TransferFailure, VectoredSubmission,
 };
+#[cfg(target_os = "linux")]
+pub use queue::group::{CompletionGroup, QueueId};
 #[cfg(target_os = "linux")]
 pub use queue::{ConnectionParams, QueueConfig, QueuePair};
 #[cfg(target_os = "linux")]
-pub use window::{RemoteAccess, RemoteDescriptor, RemoteWindow, SharedWindow};
+pub use verbs::AtomicOperation;
+#[cfg(target_os = "linux")]
+pub use window::{
+    AtomicTarget, AtomicWindow, RemoteAccess, RemoteDescriptor, RemoteWindow, SharedWindow,
+};
 
 /// Submit work and poll completions on RC queues owned by another verbs runtime.
 /// Callers retain their QP, CQ, memory registrations and DMA loans. Applications
@@ -54,8 +61,15 @@ pub use window::{RemoteAccess, RemoteDescriptor, RemoteWindow, SharedWindow};
 #[cfg(target_os = "linux")]
 pub mod verbs {
     pub use crate::sys::transfer::{
-        CompletionBatch, Opcode, PostReceipt, WorkCompletion, WorkRequest, poll, poll_batch, post,
+        AtomicOperation, CompletionBatch, CompletionEntry, Opcode, PostReceipt, Segment,
+        WorkCompletion, WorkRequest, poll, poll_batch, poll_entry, post,
     };
+}
+
+/// Blocking standard RDMA-CM connection management with completion-driven messages.
+#[cfg(all(target_os = "linux", feature = "cm"))]
+pub mod cm {
+    pub use crate::sys::cm::{CmConnection, CmListener, CmMessage};
 }
 
 use std::{error, ffi::OsString, fmt, io};

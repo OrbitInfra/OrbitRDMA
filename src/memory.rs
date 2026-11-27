@@ -148,13 +148,23 @@ impl RegisteredRange {
             .claim(self.bounds.clone(), true, None, Charge::Range)
             .map(WriteRange)
     }
-    pub(crate) fn dma(&self, domain: &Arc<Domain>, write: bool, receive: bool) -> Result<Loan> {
+    pub(crate) fn dma_segment(&self, domain: &Arc<Domain>, write: bool) -> Result<Loan> {
+        self.region
+            .claim(self.bounds.clone(), write, Some(domain), Charge::Range)
+    }
+    pub(crate) fn dma(
+        &self,
+        domain: &Arc<Domain>,
+        write: bool,
+        receive: bool,
+        total: usize,
+    ) -> Result<Loan> {
         self.region.claim(
             self.bounds.clone(),
             write,
             Some(domain),
             Charge::Payload {
-                bytes: self.bounds.len(),
+                bytes: total,
                 receive,
             },
         )

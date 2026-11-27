@@ -25,6 +25,18 @@ Source paths in this table are relative to OrbiTE's `src/transport/rdma/` unless
 
 During the switch, give each live QP and CQ exactly one owner. Migrate host-only connections first. If a host/CUDA session shares a QP or CQ, move that entire resource group together when its dependencies are ready. Two completion pollers could otherwise consume each other's receipts. Exercise both OrbiTE feature combinations, `rdma` and `rdma,cuda`, through their normal entry points.
 
+### What a transport engine can delegate
+
+Against [OrbiTE main at 65e4d5b](https://github.com/OrbitInfra/OrbiTE/tree/65e4d5bf98c4e753549129719c646feb824b7f39/src/transport/rdma), the production verbs entry points already call OrbitRDMA. Three groups of engine-side ownership and accounting remain as consumer migration work. Each row includes the corresponding public library mechanism. The engine still owns its control protocol, registered CUDA backing and decisions about retrying or changing rails.
+
+| OrbiTE call sites | Reusable OrbitRDMA work | OrbiTE responsibility |
+| --- | --- | --- |
+| `sys/cq.rs`, `cq_lane/{poll,completion}.rs` | One native poll for up to 32 CQEs, completion decoding in provider order, QP/WR dispatch and bounded work namespaces. `CompletionGroup` owns a shared CQ for library-owned QPs. An externally owned engine CQ uses `verbs::poll_batch`. | Lane threads, wake policy, per-engine capacity, queue generation and scheduling. |
+| `qp/{send_queue,receive_queue}.rs`, `slice.rs` | Known or possible post prefix, selective-signaling receipts, posted range and credit retirement, receive ownership and SRQs. The owned API retains its own registrations. | Mapping receipts to transfer aliases, grant messages, byte and bandwidth statistics, CUDA or staging loans, retry policy. An SRQ and OrbiTE's grant acknowledgement serve different roles. |
+| `context/{gpu_keys,key_domain}.rs` | A bounded native PD key cursor burns index/tag candidates in the same `KeyHistory` before firmware creation. Existing provider operations allocate and inspect named mlx5 objects. | Authorization of a CUDA range, GPU readiness, allocation budgets, choice of direct/staged path and the decision to retry a busy index. |
+
+The client also supports vectored RC requests, SEND/WRITE immediate values, atomic-only windows, UD, shared receive queues and optional standard RDMA-CM. Each mode has a two-process public example. Device acceptance depends on the provider, advertised capabilities and installed runs. RXE exercises the Linux software RoCE stack. Native IB, physical RNIC throughput and GPU Direct RDMA require separate measurements. [Advanced peer](../tests/package/advanced_peer.rs) · [CM peer](../tests/package/cm_peer.rs) · [Performance methodology](../benches/comparison/README.md)
+
 ## Delivery order
 
 | Milestone | Deliverable | Exit check |

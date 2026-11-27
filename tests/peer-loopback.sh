@@ -5,6 +5,7 @@ if (( $# < 4 || $# > 5 )); then
     echo "usage: $0 HOST_PEER_BINARY DEVICE PORT GID_INDEX [REPETITIONS]" >&2
     exit 2
 fi
+host=${ORBITRDMA_CONTROL_HOST:-127.0.0.1}
 binary=$1
 device=$2
 port=$3
@@ -26,11 +27,11 @@ for ((i=1; i<=count; i++)); do
     # actual bound address before accepting its single control connection.
     # Create an empty log before the parent starts checking readiness.
     : >"$work/server"
-    timeout 30 "$binary" listen 127.0.0.1:0 "$device" "$port" "$gid" >>"$work/server" 2>&1 &
+    timeout 30 "$binary" listen "$host:0" "$device" "$port" "$gid" >>"$work/server" 2>&1 &
     server=$!
     address=
     for ((n=0; n<200; n++)); do
-        address=$(sed -n 's/^Listening on \(127\.0\.0\.1:[0-9]*\)$/\1/p' "$work/server")
+        address=$(sed -n 's/^Listening on \([^ ]*:[0-9]*\)$/\1/p' "$work/server")
         [[ -n "$address" ]] && break
         kill -0 "$server" 2>/dev/null || break
         sleep 0.02

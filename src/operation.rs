@@ -12,6 +12,7 @@ use std::{
 #[cfg(feature = "tokio")]
 pub(crate) mod notification;
 mod queue;
+pub use queue::{DatagramAddress, DatagramQueue, SharedReceiveQueue};
 pub(crate) use queue::{PayloadQueue, reserve_ids};
 
 /// One local range is one verbs work request.
@@ -100,6 +101,17 @@ impl std::error::Error for RejectedOne {
     }
 }
 
+/// A scatter/gather post borrows range descriptors at submission. Access the
+/// original ranges after this receipt retires; each physical loan lives on the QP.
+pub struct VectoredSubmission {
+    pub status: PostStatus,
+    receipt: Operation,
+}
+impl VectoredSubmission {
+    pub fn receipt(&self) -> &Operation {
+        &self.receipt
+    }
+}
 /// Receipt for one accepted or possibly accepted work request.
 pub struct SingleSubmission {
     pub status: PostStatus,
@@ -143,6 +155,21 @@ pub enum TransferFailure {
     Cancelled,
     QueueClosed,
 }
+/// Host-order immediate data reported by a successful receive CQE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Immediate {
+    /// SEND_WITH_IMM delivered message bytes into the posted receive ranges.
+    Message(u32),
+    /// WRITE_WITH_IMM wrote the remote window, consuming a receive credit but no receive-buffer bytes.
+    RemoteWrite { value: u32, written: u32 },
+}
+/// Metadata for a completed UD receive. The payload starts at byte 40 of the posted range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatagramReceipt {
+    pub source_qp: u32,
+    pub has_grh: bool,
+    pub payload_bytes: u32,
+}
 /// Logical outcome of one WR. Failed WRs contribute no proven payload bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -170,6 +197,8 @@ pub enum Reclaim {
 }
 #[derive(Default)]
 struct State {
+    datagram: Option<DatagramReceipt>,
+    immediate: Option<Immediate>,
     outcome: Option<Outcome>,
     retired: bool,
     quarantine: Option<Fault>,
@@ -196,6 +225,13 @@ impl Operation {
     }
     pub fn outcome(&self) -> Option<Outcome> {
         lock(&self.state).outcome
+    }
+    /// Receipt metadata becomes available when the queue retires a successful receive.
+    pub fn immediate(&self) -> Option<Immediate> {
+        lock(&self.state).immediate
+    }
+    pub fn datagram(&self) -> Option<DatagramReceipt> {
+        lock(&self.state).datagram
     }
     pub fn is_reusable(&self) -> bool {
         lock(&self.state).retired
@@ -225,7 +261,8 @@ impl Operation {
             return Ok(true);
         }
         drop(state);
-        if !queue.connected()?.payload.contains(self.id) {
+        let d = queue.connected()?;
+        if !d.payload.contains(self.id) && !d.srq.as_ref().is_some_and(|s| s.contains(self.id)) {
             return Err(Error::Invalid("operation belongs to another QP"));
         }
         Ok(false)

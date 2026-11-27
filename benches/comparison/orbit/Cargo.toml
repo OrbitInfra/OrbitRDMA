@@ -1,0 +1,11 @@
+[package]
+name = "bench-orbit"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+orbit-rdma = { path = "../../..", features = ["tokio"] }
+tokio = { version = "=1.52.3", features = ["rt", "net", "time"] }
+
+[features]
+single = []

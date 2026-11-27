@@ -6,8 +6,8 @@ use crate::device::{Charge, Permit};
 use crate::memory::Loan;
 use crate::resource::{Cleanup, Fault, Owner, Result};
 use crate::{Error, QueuePair, RegisteredMemory, sys};
-pub use shared::SharedWindow;
 pub(crate) use shared::Windows;
+pub use shared::{AtomicTarget, AtomicWindow, SharedWindow};
 use std::ops::Range;
 
 /// Direction of the peer's access to this window.

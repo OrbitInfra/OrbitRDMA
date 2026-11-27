@@ -22,6 +22,7 @@ required-features = ["tokio"]
 
 [features]
 default = []
+cm = []
 provider = []
 mlx5 = ["provider"]
 tokio = ["dep:tokio"]
@@ -44,3 +45,12 @@ unsafe_code = "deny"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[[example]]
+name = "advanced_peer"
+path = "tests/package/advanced_peer.rs"
+
+[[example]]
+name = "cm_peer"
+path = "tests/package/cm_peer.rs"
+required-features = ["cm"]
