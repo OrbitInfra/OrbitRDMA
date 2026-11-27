@@ -144,6 +144,9 @@ impl Windows {
 }
 
 /// A grant on a shared RC QP. Drive its original queue to publish or revoke it.
+/// The grant owner initiates revocation. The peer acknowledges its last use
+/// over the control channel or with a plain SEND. It must not use SEND_WITH_INV
+/// on this rkey. A RECV's invalidated_rkey belongs to a separate key protocol.
 /// Dropping or forgetting this token leaves the grant with the QP until close.
 #[must_use = "revoke the window or close its queue to retire the grant"]
 pub struct SharedWindow {
