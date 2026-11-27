@@ -1,6 +1,5 @@
 //! Per-QP accounting adapted from OrbiTE's send/receive queues and slice retirement.
 use super::*;
-use crate::device::{Charge, Permit};
 use crate::memory::Loan;
 use crate::queue::QueueData;
 use crate::resource::Result;
@@ -17,12 +16,11 @@ struct Pending {
     affects_peer: bool,
     state: Arc<Mutex<State>>,
     loan: Loan,
-    permit: Permit,
 }
 impl Pending {
     fn finish(self, outcome: Outcome) {
         let mut state = lock(&self.state);
-        drop((self.loan, self.permit));
+        drop(self.loan);
         state.outcome.get_or_insert(outcome);
         state.retired = true;
     }
@@ -36,6 +34,7 @@ impl Pending {
 }
 pub(crate) struct PayloadQueue {
     pending: Vec<Pending>,
+    receive_count: usize,
     config: QueueConfig,
     used: bool,
     pub(crate) fenced: bool,
@@ -46,6 +45,7 @@ impl PayloadQueue {
     pub(crate) fn new(config: QueueConfig) -> Self {
         Self {
             pending: Vec::new(),
+            receive_count: 0,
             config,
             used: false,
             fenced: false,
@@ -69,6 +69,7 @@ impl PayloadQueue {
     }
     pub(crate) fn drained(&mut self) {
         self.fenced = true;
+        self.receive_count = 0;
         for p in self.pending.drain(..) {
             p.failed(TransferFailure::QueueClosed);
         }
@@ -77,11 +78,11 @@ impl PayloadQueue {
         if self.fenced {
             return Err(Error::Closed);
         }
-        let used = self
-            .pending
-            .iter()
-            .filter(|p| (p.opcode == sys::DataOpcode::Receive) == receive)
-            .count();
+        let used = if receive {
+            self.receive_count
+        } else {
+            self.pending.len() - self.receive_count
+        };
         let depth = if receive {
             self.config.receive_depth
         } else {
@@ -91,6 +92,13 @@ impl PayloadQueue {
             return Err(Error::Exhausted("QP work requests"));
         }
         Ok(())
+    }
+    fn take(&mut self, index: usize) -> Pending {
+        let p = self.pending.swap_remove(index);
+        if p.opcode == sys::DataOpcode::Receive {
+            self.receive_count -= 1;
+        }
+        p
     }
     fn completion(&mut self, qpn: u32, wc: sys::WorkCompletion) -> Result<()> {
         use sys::WorkCompletion::*;
@@ -108,12 +116,10 @@ impl PayloadQueue {
         match wc {
             Error { status, vendor, .. } => {
                 self.fenced = true;
-                self.pending
-                    .swap_remove(index)
-                    .failed(TransferFailure::Completion {
-                        status,
-                        vendor_error: vendor,
-                    });
+                self.take(index).failed(TransferFailure::Completion {
+                    status,
+                    vendor_error: vendor,
+                });
             }
             Success {
                 opcode,
@@ -132,24 +138,28 @@ impl PayloadQueue {
                     ));
                 }
                 let group = tail.group;
-                let mut i = 0;
-                while i < self.pending.len() {
-                    if self.pending[i].group != group {
-                        i += 1;
-                        continue;
+                let singleton = tail.id == group;
+                let tail = self.take(index);
+                let received = tail.opcode == sys::DataOpcode::Receive;
+                let tail_length = tail.length;
+                tail.finish(Outcome::Success {
+                    bytes: if received { bytes } else { tail_length },
+                    invalidated_rkey: invalidated.filter(|_| received),
+                });
+                if !singleton {
+                    let mut i = 0;
+                    while i < self.pending.len() {
+                        if self.pending[i].group == group {
+                            let p = self.take(i);
+                            let bytes = p.length;
+                            p.finish(Outcome::Success {
+                                bytes,
+                                invalidated_rkey: None,
+                            });
+                        } else {
+                            i += 1;
+                        }
                     }
-                    let p = self.pending.swap_remove(i);
-                    let n = if p.opcode == sys::DataOpcode::Receive {
-                        bytes
-                    } else {
-                        p.length
-                    };
-                    let invalidated_rkey =
-                        invalidated.filter(|_| p.opcode == sys::DataOpcode::Receive);
-                    p.finish(Outcome::Success {
-                        bytes: n,
-                        invalidated_rkey,
-                    });
                 }
             }
         }
@@ -208,10 +218,124 @@ pub(crate) fn reserve_ids(count: usize) -> Result<u64> {
     }
 }
 
+struct Signaling {
+    group: u64,
+    signaled: bool,
+    fence: bool,
+}
+
+fn post_status(receipt: sys::transfer::PostReceipt, receive: bool) -> Result<PostStatus> {
+    match (receipt.code, receipt.accepted) {
+        (code, Some(0)) => Err(Error::Native {
+            operation: if receive {
+                "ibv_post_recv"
+            } else {
+                "ibv_post_send"
+            },
+            code,
+        }),
+        (0, Some(_)) => Ok(PostStatus::Complete),
+        (code, Some(_)) => Ok(PostStatus::Partial { code }),
+        (code, None) => Ok(PostStatus::Uncertain { code }),
+    }
+}
+
 impl QueueData {
     pub(crate) fn send_capacity(&self, count: usize) -> Result<()> {
         self.payload
             .capacity(count.saturating_add(self.windows.pending()), false)
+    }
+    fn prepare(
+        &self,
+        r: &Request,
+        peer: &ConnectionParams,
+        local: &ConnectionParams,
+        id: u64,
+        signaling: Signaling,
+    ) -> Result<(Pending, WorkRequest)> {
+        let length =
+            u32::try_from(r.buffer.bounds().len()).map_err(|_| Error::Invalid("SGE length"))?;
+        let native_opcode = r.native_opcode(peer, local, length)?;
+        let receive = matches!(r.transfer, Transfer::Receive);
+        let destination = receive || matches!(r.transfer, Transfer::Read { .. });
+        let loan = r.buffer.dma(&self.domain, destination, receive)?;
+        let wr = WorkRequest::new(
+            id,
+            native_opcode,
+            loan.address(),
+            length,
+            sys::local_key(loan.mr()),
+        )
+        .signaled(signaling.signaled)
+        .fenced(signaling.fence);
+        Ok((
+            Pending {
+                id,
+                group: signaling.group,
+                opcode: r.transfer.opcode(),
+                signaled: signaling.signaled,
+                length,
+                affects_peer: r.transfer.affects_peer(),
+                state: Arc::default(),
+                loan,
+            },
+            wr,
+        ))
+    }
+    fn reserve_pending(&mut self, count: usize, receive: bool) -> Result<()> {
+        if receive {
+            self.payload.capacity(count, true)?;
+        } else {
+            self.send_capacity(count)?;
+        }
+        self.payload
+            .pending
+            .try_reserve(count)
+            .map_err(|_| Error::Exhausted("in-flight WRs"))
+    }
+    fn accept(&mut self, p: Pending, r: Request, status: PostStatus) -> Operation {
+        if let PostStatus::Uncertain { code } = status {
+            lock(&p.state).fail(TransferFailure::Post { code }, p.affects_peer);
+        }
+        if p.opcode == sys::DataOpcode::Receive {
+            self.payload.receive_count += 1;
+        } else {
+            self.payload.last_read = p.opcode == sys::DataOpcode::Read;
+        }
+        self.payload.fenced |= status != PostStatus::Complete;
+        self.payload.used = true;
+        let operation = Operation {
+            id: p.id,
+            buffer: r.buffer,
+            state: p.state.clone(),
+            affects_peer: p.affects_peer,
+        };
+        self.payload.pending.push(p);
+        operation
+    }
+    fn post_one(
+        &mut self,
+        r: &Request,
+        peer: &ConnectionParams,
+        local: &ConnectionParams,
+    ) -> Result<(Pending, PostStatus)> {
+        let qp = self.qp.ok_or(Error::Closed)?;
+        let receive = matches!(r.transfer, Transfer::Receive);
+        self.reserve_pending(1, receive)?;
+        let id = reserve_ids(1)?;
+        let (p, mut wr) = self.prepare(
+            r,
+            peer,
+            local,
+            id,
+            Signaling {
+                group: id,
+                signaled: true,
+                fence: self.payload.last_read,
+            },
+        )?;
+        let receipt = self.api.post_payload(qp, std::slice::from_mut(&mut wr))?;
+        Ok((p, post_status(receipt, receive)?))
     }
     fn post(
         &mut self,
@@ -222,24 +346,16 @@ impl QueueData {
         let qp = self.qp.ok_or(Error::Closed)?;
         let first = requests.first().ok_or(Error::Invalid("empty WR list"))?;
         let receive = matches!(first.transfer, Transfer::Receive);
-        if receive {
-            self.payload.capacity(requests.len(), true)?;
-        } else {
-            self.send_capacity(requests.len())?;
-        }
         if requests
             .iter()
             .any(|r| matches!(r.transfer, Transfer::Receive) != receive)
         {
             return Err(Error::Invalid("mixed SQ and RQ list"));
         }
+        self.reserve_pending(requests.len(), receive)?;
         let mut records = sys::storage(requests.len())?;
         let mut wrs = sys::storage(requests.len())?;
         let mut operations = sys::storage(requests.len())?;
-        self.payload
-            .pending
-            .try_reserve(requests.len())
-            .map_err(|_| Error::Exhausted("in-flight WRs"))?;
         let base = reserve_ids(requests.len())?;
         let mut group = base;
         let mut fence = self.payload.last_read;
@@ -251,15 +367,6 @@ impl QueueData {
         for (i, r) in requests.iter().enumerate() {
             let id = base + i as u64;
             let opcode = r.transfer.opcode();
-            let length =
-                u32::try_from(r.buffer.bounds().len()).map_err(|_| Error::Invalid("SGE length"))?;
-            let native_opcode = r.native_opcode(&peer, &local, length)?;
-            let destination = matches!(r.transfer, Transfer::Read { .. } | Transfer::Receive);
-            let loan = r.buffer.dma(&self.domain, destination)?;
-            let permit = self.domain.reserve(Charge::Payload {
-                bytes: length as usize,
-                receive,
-            })?;
             let end = requests
                 .get(i + 1)
                 .is_none_or(|next| matches!(next.transfer, Transfer::Read { .. }));
@@ -267,68 +374,31 @@ impl QueueData {
                 || opcode == sys::DataOpcode::Read
                 || end
                 || id - group + 1 >= u64::from(interval);
-            wrs.push(
-                WorkRequest::new(
-                    id,
-                    native_opcode,
-                    loan.address(),
-                    length,
-                    sys::local_key(loan.mr()?),
-                )
-                .signaled(signaled)
-                .fenced(fence),
-            );
-            records.push(Pending {
+            let (p, wr) = self.prepare(
+                r,
+                &peer,
+                &local,
                 id,
-                group,
-                opcode,
-                signaled,
-                length,
-                affects_peer: r.transfer.affects_peer(),
-                state: Arc::default(),
-                loan,
-                permit,
-            });
+                Signaling {
+                    group,
+                    signaled,
+                    fence,
+                },
+            )?;
+            records.push(p);
+            wrs.push(wr);
             fence = opcode == sys::DataOpcode::Read;
             if signaled {
                 group = id + 1;
             }
         }
         let receipt = self.api.post_payload(qp, &mut wrs)?;
-        if receipt.accepted == Some(0) {
-            return Err(Error::Native {
-                operation: if receive {
-                    "ibv_post_recv"
-                } else {
-                    "ibv_post_send"
-                },
-                code: receipt.code,
-            });
-        }
-        self.payload.used = true;
-        let status = match (receipt.code, receipt.accepted) {
-            (0, Some(_)) => PostStatus::Complete,
-            (code, Some(_)) => PostStatus::Partial { code },
-            (code, None) => PostStatus::Uncertain { code },
-        };
-        self.payload.fenced |= receipt.code != 0;
+        let status = post_status(receipt, receive)?;
         let count = receipt.accepted.unwrap_or(requests.len());
         // All allocations and validation precede the native call. Each possible owner
         // now moves to the QP regardless of whether the caller keeps its handle.
         for (r, p) in requests.drain(..count).zip(records) {
-            if let PostStatus::Uncertain { code } = status {
-                lock(&p.state).fail(TransferFailure::Post { code }, p.affects_peer);
-            }
-            if !receive {
-                self.payload.last_read = p.opcode == sys::DataOpcode::Read;
-            }
-            operations.push(Operation {
-                id: p.id,
-                buffer: r.buffer,
-                state: p.state.clone(),
-                affects_peer: p.affects_peer,
-            });
-            self.payload.pending.push(p);
+            operations.push(self.accept(p, r, status));
         }
         Ok(Submission {
             status,
@@ -336,17 +406,36 @@ impl QueueData {
             unposted: std::mem::take(requests),
         })
     }
+    fn completion(&mut self, qpn: u32, wc: sys::WorkCompletion) -> Result<()> {
+        if !self.windows.completion(qpn, wc)? {
+            self.payload.completion(qpn, wc)?;
+        }
+        Ok(())
+    }
     fn progress(&mut self, qpn: u32) -> Result<usize> {
         let cq = self.cq.ok_or(Error::Closed)?;
-        for count in 0..32 {
-            let Some(wc) = self.api.poll_one(cq)? else {
-                return Ok(count);
-            };
-            if !self.windows.completion(qpn, wc)? {
-                self.payload.completion(qpn, wc)?;
+        let pending = self.payload.pending.len() + self.windows.pending();
+        if pending <= 1 {
+            if let Some(wc) = self.api.poll_one(cq)? {
+                self.completion(qpn, wc)?;
+                return Ok(1);
+            }
+            return Ok(0);
+        }
+        use crate::verbs::CompletionBatch;
+        let mut batch = CompletionBatch::default();
+        let count = self
+            .api
+            .poll_batch(cq, &mut batch, pending.min(CompletionBatch::CAPACITY))?;
+        let mut error = None;
+        for wc in batch.iter() {
+            // Polling consumed all entries. A malformed receipt must not lose a later
+            // independent, valid completion. Its own unproven loans stay in the QP.
+            if let Err(e) = self.completion(qpn, wc) {
+                error.get_or_insert(e);
             }
         }
-        Ok(32)
+        error.map_or(Ok(count), Err)
     }
     // A one-shot arm survives timeouts and dropped waiters. Poll again after
     // arming so a completion between the first poll and the arm cannot be lost.
@@ -385,6 +474,30 @@ impl QueueData {
     }
 }
 impl QueuePair {
+    fn posting_queue(&mut self) -> Result<(&mut QueueData, ConnectionParams, ConnectionParams)> {
+        let peer = self.peer.ok_or(Error::Invalid("QP has not reached RTS"))?;
+        let local = self.parameters();
+        Ok((self.owner.get_mut()?, peer, local))
+    }
+    /// Posts one signaled request, keeping the WR on the stack. An ambiguous provider
+    /// error still returns an operation that owns its physical loan until retirement.
+    pub fn submit_one(
+        &mut self,
+        request: Request,
+    ) -> std::result::Result<SingleSubmission, RejectedOne> {
+        let admitted = self.posting_queue().and_then(|(d, peer, local)| {
+            let (p, status) = d.post_one(&request, &peer, &local)?;
+            Ok((d, p, status))
+        });
+        match admitted {
+            Ok((d, p, status)) => Ok(SingleSubmission {
+                status,
+                operation: d.accept(p, request, status),
+            }),
+            Err(error) => Err(RejectedOne { error, request }),
+        }
+    }
+
     /// Posts one SQ list (READ/WRITE/SEND) or one RQ list (RECV). Submission is serialized
     /// with progress and retirement. A known unposted suffix is returned immediately.
     ///
@@ -402,6 +515,31 @@ impl QueuePair {
         &mut self,
         mut requests: Vec<Request>,
     ) -> std::result::Result<Submission, Rejected> {
+        if requests.len() == 1 {
+            let mut operations = match sys::storage(1) {
+                Ok(v) => v,
+                Err(error) => return Err(Rejected { error, requests }),
+            };
+            if let Some(request) = requests.pop() {
+                return match self.submit_one(request) {
+                    Ok(one) => {
+                        operations.push(one.operation);
+                        Ok(Submission {
+                            status: one.status,
+                            operations,
+                            unposted: requests,
+                        })
+                    }
+                    Err(rejected) => {
+                        requests.push(rejected.request);
+                        Err(Rejected {
+                            error: rejected.error,
+                            requests,
+                        })
+                    }
+                };
+            }
+        }
         let result = (|| {
             let peer = self.peer.ok_or(Error::Invalid("QP has not reached RTS"))?;
             let local = self.parameters();

@@ -174,16 +174,10 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
     } /* ambiguous submission */
     return 0;
 }
-static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
-    struct test_cq *cq = (struct test_cq *)base;
-    if (event("poll"))
-        return -EIO;
-    if (n != 1)
-        return -EINVAL;
-    if (!cq->count || is("delay")) return 0;
+static void take_wc(struct test_cq *cq, struct ibv_wc *wc) {
     *wc = cq->data[cq->head++ % 256];
     --cq->count;
-    if (wc->opcode != IBV_WC_BIND_MW && wc->opcode != IBV_WC_LOCAL_INV) return 1;
+    if (wc->opcode != IBV_WC_BIND_MW && wc->opcode != IBV_WC_LOCAL_INV) return;
     for (struct test_mw *w = all_mws; w; w = w->next)
         if (w->qp && w->qp->qp.qp_num == wc->qp_num && w->control_id == wc->wr_id)
             w->control_pending = 0;
@@ -195,7 +189,20 @@ static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
         wc->opcode = IBV_WC_SEND;
     if (is("failed_wc"))
         wc->status = IBV_WC_WR_FLUSH_ERR;
-    return 1;
+}
+static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
+    struct test_cq *cq = (struct test_cq *)base;
+    if (event("poll"))
+        return -EIO;
+    if (n <= 0) return -EINVAL;
+    if (is("overreported_poll")) return n + 1;
+    if (is("delay")) return 0;
+    int count = 0;
+    while (count < n && cq->count) {
+        take_wc(cq, wc + count);
+        ++count;
+    }
+    return count;
 }
 static void fill_port(uint8_t p, struct ibv_port_attr *a) {
     a->gid_tbl_len = 2;

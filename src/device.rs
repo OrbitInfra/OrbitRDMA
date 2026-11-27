@@ -99,6 +99,7 @@ impl Drop for Permit {
         let u = &mut ledger.usage;
         match self.charge {
             Charge::Payload { bytes, receive } => {
+                u.range_loans -= 1;
                 u.in_flight_bytes -= bytes;
                 if receive {
                     u.receive_requests -= 1;
@@ -149,8 +150,10 @@ impl Domain {
         let l = self.limits;
         match charge {
             Charge::Payload { bytes, receive }
-                if bytes <= l.in_flight_bytes - u.in_flight_bytes =>
+                if u.range_loans < l.range_loans
+                    && bytes <= l.in_flight_bytes - u.in_flight_bytes =>
             {
+                u.range_loans += 1;
                 u.in_flight_bytes += bytes;
                 if receive {
                     u.receive_requests += 1;

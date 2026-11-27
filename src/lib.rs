@@ -40,8 +40,8 @@ pub use memory::{
 };
 #[cfg(target_os = "linux")]
 pub use operation::{
-    Completion, Operation, Outcome, PostStatus, Reclaim, Rejected, Request, Submission, Transfer,
-    TransferFailure,
+    Completion, Operation, Outcome, PostStatus, Reclaim, Rejected, RejectedOne, Request,
+    SingleSubmission, Submission, Transfer, TransferFailure,
 };
 #[cfg(target_os = "linux")]
 pub use queue::{ConnectionParams, QueueConfig, QueuePair};
@@ -53,7 +53,9 @@ pub use window::{RemoteAccess, RemoteDescriptor, RemoteWindow, SharedWindow};
 /// using OrbitRDMA-owned memory can use the safe [`QueuePair`] API.
 #[cfg(target_os = "linux")]
 pub mod verbs {
-    pub use crate::sys::transfer::{Opcode, PostReceipt, WorkCompletion, WorkRequest, poll, post};
+    pub use crate::sys::transfer::{
+        CompletionBatch, Opcode, PostReceipt, WorkCompletion, WorkRequest, poll, poll_batch, post,
+    };
 }
 
 use std::{error, ffi::OsString, fmt, io};

@@ -77,6 +77,34 @@ impl std::error::Error for Rejected {
     }
 }
 
+/// A failed single-request submission proved that no hardware took the range.
+pub struct RejectedOne {
+    pub error: Error,
+    pub request: Request,
+}
+impl fmt::Debug for RejectedOne {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RejectedOne")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Display for RejectedOne {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "request was not posted ({})", self.error)
+    }
+}
+impl std::error::Error for RejectedOne {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Receipt for one accepted or possibly accepted work request.
+pub struct SingleSubmission {
+    pub status: PostStatus,
+    pub operation: Operation,
+}
 /// Receipt for a single native list post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostStatus {

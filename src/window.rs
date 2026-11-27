@@ -152,7 +152,7 @@ impl QueuePair {
                 key,
                 Some(sys::Bind {
                     mw,
-                    mr: loan.mr()?,
+                    mr: loan.mr(),
                     address: loan.address(),
                     length: loan.length,
                     access,

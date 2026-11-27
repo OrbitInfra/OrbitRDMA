@@ -139,16 +139,25 @@ impl RegisteredRange {
         self.bounds.clone()
     }
     pub fn read(&self) -> Result<ReadRange> {
-        self.region.claim(self.bounds.clone(), false).map(ReadRange)
+        self.region
+            .claim(self.bounds.clone(), false, None, Charge::Range)
+            .map(ReadRange)
     }
     pub fn write(&self) -> Result<WriteRange> {
-        self.region.claim(self.bounds.clone(), true).map(WriteRange)
+        self.region
+            .claim(self.bounds.clone(), true, None, Charge::Range)
+            .map(WriteRange)
     }
-    pub(crate) fn dma(&self, domain: &Arc<Domain>, write: bool) -> Result<Loan> {
-        if !Arc::ptr_eq(domain, &lock(&self.region.state).owner.get()?.domain) {
-            return Err(Error::Invalid("foreign protection domain"));
-        }
-        self.region.claim(self.bounds.clone(), write)
+    pub(crate) fn dma(&self, domain: &Arc<Domain>, write: bool, receive: bool) -> Result<Loan> {
+        self.region.claim(
+            self.bounds.clone(),
+            write,
+            Some(domain),
+            Charge::Payload {
+                bytes: self.bounds.len(),
+                receive,
+            },
+        )
     }
 }
 
@@ -203,10 +212,20 @@ impl Region {
         }
         Ok(())
     }
-    fn claim(self: &Arc<Self>, range: Range<usize>, write: bool) -> Result<Loan> {
+    fn claim(
+        self: &Arc<Self>,
+        range: Range<usize>,
+        write: bool,
+        domain: Option<&Arc<Domain>>,
+        charge: Charge,
+    ) -> Result<Loan> {
         let mut state = lock(&self.state);
         let Registration { owner, claims } = &mut *state;
         let data = owner.get()?;
+        if domain.is_some_and(|expected| !Arc::ptr_eq(expected, &data.domain)) {
+            return Err(Error::Invalid("foreign protection domain"));
+        }
+        let mr = data.mr.ok_or(Error::Closed)?;
         Self::check(data, &range)?;
         if claims
             .entries
@@ -215,7 +234,7 @@ impl Region {
         {
             return Err(Error::Busy);
         }
-        let permit = data.domain.reserve(Charge::Range)?;
+        let permit = data.domain.reserve(charge)?;
         claims
             .entries
             .try_reserve(1)
@@ -236,6 +255,7 @@ impl Region {
             region: self.clone(),
             id,
             pointer,
+            mr,
             length: range.len(),
             _permit: permit,
         })
@@ -255,7 +275,7 @@ impl RegisteredMemory {
         self.inner
             .as_ref()
             .ok_or(Error::Closed)?
-            .claim(range, write)
+            .claim(range, write, None, Charge::Range)
     }
     /// Borrows a nonempty byte range. Overlapping readers can coexist.
     pub fn read(&self, range: Range<usize>) -> Result<ReadRange> {
@@ -285,9 +305,6 @@ impl RegisteredMemory {
     ) -> Result<Loan> {
         use crate::RemoteAccess::{Read, Write};
         let region = self.inner.as_ref().ok_or(Error::Closed)?;
-        if !Arc::ptr_eq(domain, &lock(&region.state).owner.get()?.domain) {
-            return Err(Error::Invalid("foreign protection domain"));
-        }
         if permissions == Permissions::Local
             || [Read, Write]
                 .into_iter()
@@ -295,7 +312,12 @@ impl RegisteredMemory {
         {
             return Err(Error::PermissionDenied);
         }
-        self.claim(range, permissions.allows(Write))
+        region.claim(
+            range,
+            permissions.allows(Write),
+            Some(domain),
+            Charge::Range,
+        )
     }
     /// Returns the original backing after the final loan and successful deregistration.
     /// Idle range descriptors become closed, including those in an uncollected completion.
@@ -316,6 +338,8 @@ pub(crate) struct Loan {
     region: Arc<Region>,
     id: u64,
     pointer: NonNull<u8>,
+    // Deregistration checks this same live claim before it can consume the MR.
+    mr: sys::Mr,
     pub length: usize,
     _permit: Permit,
 }
@@ -330,12 +354,8 @@ impl Loan {
     pub(crate) fn address(&self) -> u64 {
         self.pointer.as_ptr() as usize as u64
     }
-    pub(crate) fn mr(&self) -> Result<sys::Mr> {
-        lock(&self.region.state)
-            .owner
-            .get()?
-            .mr
-            .ok_or(Error::Closed)
+    pub(crate) fn mr(&self) -> sys::Mr {
+        self.mr
     }
     fn bytes(&self) -> &[u8] {
         // SAFETY: only local guards call this; the range claim excludes every conflicting writer.

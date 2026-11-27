@@ -241,6 +241,55 @@ pub unsafe fn post(qp: NonNull<c_void>, entries: &mut [WorkRequest]) -> Result<P
     }
 }
 
+fn empty_wc() -> ffi::ibv_wc {
+    ffi::ibv_wc {
+        status: ffi::IBV_WC_GENERAL_ERR,
+        opcode: ffi::IBV_WC_LOCAL_INV,
+        ..Default::default()
+    }
+}
+
+fn decode(wc: &ffi::ibv_wc) -> WorkCompletion {
+    if wc.status != ffi::IBV_WC_SUCCESS {
+        return WorkCompletion::Error {
+            id: wc.wr_id,
+            qpn: wc.qp_num,
+            status: wc.status,
+            vendor: wc.vendor_err,
+        };
+    }
+    let invalidated = if wc.wc_flags & ffi::IBV_WC_WITH_INV != 0 {
+        // SAFETY: the flags on this successful CQE select the host-order key in the initialized union.
+        Some(unsafe { wc.__bindgen_anon_1.invalidated_rkey })
+    } else {
+        None
+    };
+    WorkCompletion::Success {
+        id: wc.wr_id,
+        qpn: wc.qp_num,
+        opcode: wc.opcode,
+        bytes: wc.byte_len,
+        flags: wc.wc_flags,
+        invalidated,
+    }
+}
+
+// SAFETY contract inherited by both public polling entry points.
+unsafe fn poll_into(cq: NonNull<c_void>, entries: &mut [ffi::ibv_wc]) -> Result<usize, Error> {
+    let cq = cq.cast::<ffi::ibv_cq>().as_ptr();
+    // SAFETY: the caller retains this CQ and its context throughout the call.
+    let poll = unsafe { (*(*cq).context).ops.poll_cq }.ok_or(Error::Unsupported("ibv_poll_cq"))?;
+    // SAFETY: both callers provide 1..=32 writable entries and own CQ dispatch.
+    let count = unsafe { poll(cq, entries.len() as i32, entries.as_mut_ptr()) };
+    if count < 0 || count as usize > entries.len() {
+        return Err(Error::Native {
+            operation: "ibv_poll_cq",
+            code: count,
+        });
+    }
+    Ok(count as usize)
+}
+
 /// Poll one native CQE. An empty poll returns `Ok(None)`.
 ///
 /// # Safety
@@ -248,44 +297,55 @@ pub unsafe fn post(qp: NonNull<c_void>, entries: &mut [WorkRequest]) -> Result<P
 /// `cq` must point to a live, compatible libibverbs CQ. The caller must retain
 /// its context and provider and own dispatch for every QP sharing this CQ.
 pub unsafe fn poll(cq: NonNull<c_void>) -> Result<Option<WorkCompletion>, Error> {
-    let cq = cq.cast::<ffi::ibv_cq>().as_ptr();
-    // SAFETY: the caller retains this CQ and its context throughout the call.
-    let poll = unsafe { (*(*cq).context).ops.poll_cq }.ok_or(Error::Unsupported("ibv_poll_cq"))?;
-    let mut wc = ffi::ibv_wc {
-        status: ffi::IBV_WC_GENERAL_ERR,
-        opcode: ffi::IBV_WC_LOCAL_INV,
-        ..Default::default()
-    };
-    // SAFETY: the provider has space for exactly one WC initialized to failure.
-    match unsafe { poll(cq, 1, &mut wc) } {
-        0 => Ok(None),
-        1 if wc.status != ffi::IBV_WC_SUCCESS => Ok(Some(WorkCompletion::Error {
-            id: wc.wr_id,
-            qpn: wc.qp_num,
-            status: wc.status,
-            vendor: wc.vendor_err,
-        })),
-        1 => {
-            let invalidated = if wc.wc_flags & ffi::IBV_WC_WITH_INV != 0 {
-                // SAFETY: the flags on this successful CQE select the host-order key in the initialized union.
-                Some(unsafe { wc.__bindgen_anon_1.invalidated_rkey })
-            } else {
-                None
-            };
-            Ok(Some(WorkCompletion::Success {
-                id: wc.wr_id,
-                qpn: wc.qp_num,
-                opcode: wc.opcode,
-                bytes: wc.byte_len,
-                flags: wc.wc_flags,
-                invalidated,
-            }))
+    let mut wc = empty_wc();
+    // SAFETY: the caller retains the CQ; this slice has one writable entry.
+    let count = unsafe { poll_into(cq, std::slice::from_mut(&mut wc)) }?;
+    Ok((count == 1).then(|| decode(&wc)))
+}
+
+/// Reusable storage for one provider poll. Iteration decodes only returned CQEs,
+/// in provider order. Failed completions expose only the fields defined by verbs.
+pub struct CompletionBatch {
+    entries: [ffi::ibv_wc; Self::CAPACITY],
+    len: usize,
+}
+impl Default for CompletionBatch {
+    fn default() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| empty_wc()),
+            len: 0,
         }
-        count => Err(Error::Native {
-            operation: "ibv_poll_cq",
-            code: count,
-        }),
     }
+}
+impl CompletionBatch {
+    pub const CAPACITY: usize = 32;
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = WorkCompletion> + '_ {
+        self.entries[..self.len].iter().map(decode)
+    }
+}
+
+/// Read up to `limit` CQEs in one provider call. A failed or empty poll leaves
+/// the batch empty. The caller must dispatch the entire returned prefix.
+///
+/// # Safety
+///
+/// The CQ, its context and provider must remain live. The caller must own
+/// dispatch for all QPs sharing the CQ, as for [`poll`].
+pub unsafe fn poll_batch(
+    cq: NonNull<c_void>,
+    batch: &mut CompletionBatch,
+    limit: usize,
+) -> Result<usize, Error> {
+    batch.len = 0;
+    let entries = batch
+        .entries
+        .get_mut(..limit)
+        .filter(|entries| !entries.is_empty())
+        .ok_or(Error::Invalid("CQ poll limit"))?;
+    // SAFETY: the caller retains the CQ and the checked slice is writable.
+    batch.len = unsafe { poll_into(cq, entries) }?;
+    Ok(batch.len)
 }
 
 impl Native {
@@ -300,6 +360,16 @@ impl Native {
     pub(crate) fn poll_one(&self, cq: Cq) -> RdmaResult<Option<WorkCompletion>> {
         // SAFETY: the owning queue holds its context and is the sole consumer of this CQ.
         unsafe { poll(cq.0.cast()) }
+    }
+
+    pub(crate) fn poll_batch(
+        &self,
+        cq: Cq,
+        batch: &mut CompletionBatch,
+        limit: usize,
+    ) -> RdmaResult<usize> {
+        // SAFETY: the owning queue retains the CQ and dispatches every returned CQE.
+        unsafe { poll_batch(cq.0.cast(), batch, limit) }
     }
 
     pub(crate) fn arm(&self, cq: Cq) -> RdmaResult<()> {

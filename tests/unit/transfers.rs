@@ -692,3 +692,86 @@ fn admission_limits_stale_incarnations_and_cross_thread_loans() {
         },
     );
 }
+
+#[test]
+fn single_post_preserves_range_and_charges_across_native_failures() {
+    case(
+        "single_post_preserves_range_and_charges_across_native_failures",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            let mut q = conn(&d);
+            let request = Request::new(m.range(1..7).unwrap(), Transfer::Receive);
+            p.post_result(0, 0);
+            let rejected = q.submit_one(request).err().unwrap();
+            assert_eq!(rejected.request.buffer.bounds(), 1..7);
+            assert_eq!(d.usage().unwrap().range_loans, 0);
+            p.post_result(0, 2);
+            let posted = q.submit_one(rejected.request).unwrap();
+            assert_eq!(posted.status, PostStatus::Uncertain { code: libc::ENOMEM });
+            assert!(!posted.operation.is_reusable());
+            drop(posted.operation);
+            assert!(matches!(m.read(1..7), Err(Error::Busy)));
+            assert_eq!(q.progress().unwrap(), 0);
+            let used = d.usage().unwrap();
+            assert_eq!(
+                (
+                    used.receive_requests,
+                    used.range_loans,
+                    used.in_flight_bytes
+                ),
+                (1, 1, 6)
+            );
+            q.close().unwrap();
+            let used = d.usage().unwrap();
+            assert_eq!(
+                (
+                    used.receive_requests,
+                    used.range_loans,
+                    used.in_flight_bytes
+                ),
+                (0, 0, 0)
+            );
+            assert!(m.write(1..7).is_ok());
+        },
+    );
+}
+
+#[test]
+fn batch_dispatch_after_malformed_and_impossible_counts() {
+    case(
+        "batch_dispatch_after_malformed_and_impossible_counts",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let m = d.register(bytes(16), Permissions::Local).unwrap();
+            let mut q = conn(&d);
+            let n = q.parameters().qpn;
+            let ops = q
+                .submit(batch(&m, Transfer::Receive, &[0, 2, 4]))
+                .unwrap()
+                .operations;
+            p.emit(n, ops[0].id(), n + 1, (128, 2, 0), None);
+            p.emit(n, ops[1].id(), n, (128, 2, 0), None);
+            p.emit(n, ops[2].id(), n, (u32::MAX, u32::MAX, 7), Some(42));
+            p.option("overreported_poll");
+            assert!(q.progress().is_err());
+            assert!(ops.iter().all(|op| !op.is_reusable()));
+            p.option("manual");
+            let polls = p.count("poll");
+            assert!(q.progress().is_err());
+            assert_eq!(p.count("poll"), polls + 1);
+            assert!(!ops[0].is_reusable());
+            assert_eq!(ops[1].outcome(), Some(success(2)));
+            assert!(matches!(ops[2].outcome(), Some(Outcome::Failed { .. })));
+            assert!(m.write(2..6).is_ok());
+            assert!(matches!(m.read(0..2), Err(Error::Busy)));
+            p.emit(n, ops[0].id(), n, (128, 2, 0), None);
+            let polls = p.count("poll");
+            assert_eq!(q.progress().unwrap(), 1);
+            assert_eq!(p.count("poll"), polls + 1);
+            assert_eq!(d.usage().unwrap().range_loans, 0);
+        },
+    );
+}
