@@ -108,6 +108,9 @@ static int shared_recv(struct ibv_srq *s,struct ibv_recv_wr *wr,struct ibv_recv_
 }
 struct ibv_ah *ibv_create_ah(struct ibv_pd *pd,struct ibv_ah_attr *attr){
     if(event("create_ah") || !attr->port_num) return NULL;
+    if (attr->port_num == 2 && attr->is_global &&
+        (attr->grh.dgid.raw[15] != 2 || attr->grh.sgid_index != 1 || !attr->grh.hop_limit)) return NULL;
+    event(attr->is_global ? "ah_global" : "ah_local");
     struct ibv_ah *ah=calloc(1,sizeof(*ah));
     if(ah) { ah->pd=pd; ah->context=pd->context; }
     return ah;
@@ -290,6 +293,8 @@ int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) {
     a->phys_port_cnt = 2;
     a->max_qp_wr = 128;
     a->max_sge = 8;
+    a->max_sge_rd = 1;
+    a->max_srq_wr = 160;
     a->atomic_cap = is("no_atomics") ? IBV_ATOMIC_NONE : IBV_ATOMIC_HCA;
     a->max_cqe = 192;
     a->max_qp_rd_atom = 3;

@@ -46,7 +46,8 @@ impl DatagramQueue {
             || !(1..=5).contains(&peer.mtu)
             || peer.link != self.address.link
             || (peer.link == Link::InfiniBand && peer.lid == 0)
-            || (peer.link != Link::InfiniBand && (peer.gid == [0; 16] || peer.gid[0] == 0xff))
+            || (peer.link != Link::InfiniBand && peer.gid == [0; 16])
+            || peer.gid[0] == 0xff
         {
             return Err(Error::Invalid("UD destination"));
         }

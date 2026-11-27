@@ -60,6 +60,14 @@ fn cm_check(op: &'static str, rc: i32) -> RdmaResult<()> {
         },
     )
 }
+fn resolver_node(addr: SocketAddr) -> RdmaResult<CString> {
+    let node = match addr {
+        SocketAddr::V6(v6) if v6.scope_id() != 0 => format!("{}%{}", v6.ip(), v6.scope_id()),
+        _ => addr.ip().to_string(),
+    };
+    CString::new(node).map_err(|_| Error::Invalid("CM address"))
+}
+
 struct Endpoint {
     api: std::sync::Arc<CmApi>,
     id: NonNull<ffi::rdma_cm_id>,
@@ -73,7 +81,7 @@ impl Drop for Endpoint {
 impl Endpoint {
     fn create(addr: SocketAddr, passive: bool) -> RdmaResult<Self> {
         let api = std::sync::Arc::new(CmApi::load()?);
-        let node = CString::new(addr.ip().to_string()).map_err(|_| Error::Invalid("CM address"))?;
+        let node = resolver_node(addr)?;
         let service =
             CString::new(addr.port().to_string()).map_err(|_| Error::Invalid("CM service"))?;
         let hints = ffi::rdma_addrinfo {
@@ -388,5 +396,26 @@ impl CmConnection {
             return Err(Error::Busy);
         }
         self.0.release().map(drop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cm_preserves_numeric_interface_scopes() {
+        for (address, host) in [
+            ("127.0.0.1:1", "127.0.0.1"),
+            ("[::1]:1", "::1"),
+            ("[fe80::1%7]:1", "fe80::1%7"),
+        ] {
+            assert_eq!(
+                resolver_node(address.parse().unwrap())
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                host
+            );
+        }
     }
 }

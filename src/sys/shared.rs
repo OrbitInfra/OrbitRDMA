@@ -118,7 +118,7 @@ impl Native {
             dlid: peer.lid,
             ..Default::default()
         };
-        if local.link != crate::Link::InfiniBand {
+        if local.link != crate::Link::InfiniBand || peer.gid != [0; 16] {
             attr.is_global = 1;
             attr.grh.dgid.raw = peer.gid;
             attr.grh.sgid_index = local.gid_index;

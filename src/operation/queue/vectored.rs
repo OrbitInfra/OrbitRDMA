@@ -19,6 +19,11 @@ impl QueuePair {
             return Err(Error::Invalid("QP scatter/gather limit"));
         }
         let receive = matches!(transfer, Transfer::Receive);
+        if matches!(transfer, Transfer::Read { .. })
+            && ranges.len() > d.domain.caps.max_read_sge as usize
+        {
+            return Err(Error::Unsupported("RDMA READ scatter/gather limit"));
+        }
         let destination = receive || matches!(transfer, Transfer::Read { .. });
         let qp = d.qp.ok_or(Error::Closed)?;
         d.reserve_pending(1, receive)?;

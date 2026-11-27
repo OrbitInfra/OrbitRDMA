@@ -40,6 +40,7 @@ impl Pending {
             state.outcome = Some(outcome);
         }
         state.retired = true;
+        state.quarantine = None;
     }
     fn failed(self, reason: TransferFailure) {
         let remote_effect_unknown = self.affects_peer;

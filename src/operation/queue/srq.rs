@@ -29,7 +29,7 @@ pub struct SharedReceiveQueue(Arc<Mutex<Owner<Shared>>>);
 impl Device {
     pub fn shared_receive_queue(&self, depth: u32) -> Result<SharedReceiveQueue> {
         let domain = self.domain()?;
-        if depth == 0 || depth > domain.caps.max_wr {
+        if depth == 0 || depth > domain.caps.max_srq_wr {
             return Err(Error::Invalid("shared receive depth"));
         }
         let (api, _, pd) = domain.native()?;
@@ -52,9 +52,37 @@ impl Device {
     }
 }
 impl SharedReceiveQueue {
+    // No SRQ WQE is tied to a QP until a receive is consumed. QP destruction
+    // can purge unread CQEs, so exclude concurrent SRQ posts through teardown.
+    pub(crate) fn detach<T, E>(
+        &self,
+        explicit: bool,
+        destroy: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> Result<std::result::Result<T, E>> {
+        let mut guard = lock(&self.0);
+        let receipts = &mut guard.get_mut()?.receipts;
+        if !receipts.pending.is_empty() {
+            if explicit && !receipts.fenced {
+                return Err(Error::Busy);
+            }
+            receipts.quarantine(Fault(
+                "shared receive CQ retired with pending work",
+                libc::EIO,
+            ));
+        }
+        let result = destroy();
+        if result.is_err() {
+            // A QP whose destruction is uncertain could consume a future WQE.
+            receipts.quarantine(Fault("shared receive QP teardown failed", libc::EIO));
+        }
+        Ok(result)
+    }
     pub(crate) fn native(&self, domain: &Arc<Domain>) -> Result<(Srq, u32)> {
         let guard = lock(&self.0);
         let d = guard.get()?;
+        if d.receipts.fenced {
+            return Err(Error::Closed);
+        }
         if !Arc::ptr_eq(domain, &d.domain) {
             return Err(Error::Invalid("foreign SRQ protection domain"));
         }

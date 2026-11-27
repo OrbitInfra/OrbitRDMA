@@ -940,6 +940,125 @@ fn shared_cq_routes_interleaved_qps_and_rejects_stale_receipts() {
 }
 
 #[test]
+fn srq_close_preserves_unread_cqe_and_sibling_capacity() {
+    case("srq_close_preserves_unread_cqe_and_sibling_capacity", |p| {
+        let d = device();
+        let memory = d.register(bytes(8), Permissions::Local).unwrap();
+        let mut pool = d.shared_receive_queue(1).unwrap();
+        let attach = || {
+            let mut q = d
+                .queue_pair_with_srq(QueueConfig::new(12), 1, &pool)
+                .unwrap();
+            let mut peer = q.parameters();
+            peer.qpn += 10;
+            q.connect(&peer).unwrap();
+            q
+        };
+        let (mut a, mut b, mut c) = (attach(), attach(), attach());
+        let first = pool.post(&memory.range(0..4).unwrap()).unwrap().operation;
+        let qpn = a.parameters().qpn;
+        p.emit(qpn, first.id(), qpn, (128, 3, 0), None);
+        assert!(matches!(a.close(), Err(Error::Busy)));
+        assert!(!first.is_reusable());
+        assert_eq!(a.progress().unwrap(), 1);
+        a.close().unwrap();
+        let second = pool.post(&memory.range(0..4).unwrap()).unwrap().operation;
+        let qpn = b.parameters().qpn;
+        p.emit(qpn, second.id(), qpn, (128, 4, 0), None);
+        b.progress().unwrap();
+        assert_eq!(ready(second).outcome, success(4));
+        let lost = pool.post(&memory.range(0..4).unwrap()).unwrap().operation;
+        drop(b);
+        assert!(!lost.is_reusable());
+        assert!(matches!(
+            pool.post(&memory.range(4..8).unwrap()),
+            Err(Error::Closed)
+        ));
+        c.close().unwrap();
+        assert!(matches!(memory.write(0..4), Err(Error::Busy)));
+        pool.close().unwrap();
+        assert!(lost.is_reusable());
+        assert!(matches!(lost.try_reclaim(), Reclaim::Ready(_)));
+    });
+}
+
+#[test]
+fn failed_srq_qp_destroy_fences_future_receives() {
+    case("failed_srq_qp_destroy_fences_future_receives", |p| {
+        let d = device();
+        let m = d.register(bytes(4), Permissions::Local).unwrap();
+        let mut s = d.shared_receive_queue(1).unwrap();
+        let mut q = d.queue_pair_with_srq(QueueConfig::new(12), 1, &s).unwrap();
+        let peer = q.parameters();
+        q.connect(&peer).unwrap();
+        p.fault("free_qp", "");
+        assert!(matches!(q.close(), Err(Error::Unquiesced { .. })));
+        assert!(matches!(
+            s.post(&m.range(0..4).unwrap()),
+            Err(Error::Closed)
+        ));
+        assert_eq!(p.count("post_srq"), 0);
+    });
+}
+
+#[test]
+fn srq_private_window_and_provider_specific_caps() {
+    case("srq_private_window_and_provider_specific_caps", |p| {
+        let d = device();
+        let m = d.register(bytes(8), Permissions::RemoteRead).unwrap();
+        let s = d.shared_receive_queue(150).unwrap();
+        assert!(d.shared_receive_queue(161).is_err());
+        let mut q = d.queue_pair_with_srq(QueueConfig::new(1), 2, &s).unwrap();
+        let peer = q.parameters();
+        q.connect(&peer).unwrap();
+        let remote = RemoteDescriptor {
+            qpn: peer.qpn,
+            address: 64,
+            rkey: 3,
+            length: 8,
+            access: RemoteAccess::Read,
+        };
+        assert!(matches!(
+            q.submit_vectored(
+                &[m.range(0..2).unwrap(), m.range(4..6).unwrap()],
+                Transfer::Read { remote, offset: 0 }
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(p.count("sq_wr"), 0);
+        assert!(matches!(
+            q.expose(&m, 0..4, RemoteAccess::Read),
+            Err(Error::Busy)
+        ));
+        assert_eq!(p.count("alloc_mw"), 0);
+    });
+}
+
+#[test]
+fn ud_infiniband_accepts_lid_or_unicast_global_route() {
+    case("ud_infiniband_accepts_lid_or_unicast_global_route", |p| {
+        let d = Device::open("cpu-first", 2, 1, Limits::default()).unwrap();
+        let mut q = d.datagram_queue(QueueConfig::new(1), 3).unwrap();
+        let dest = q.address();
+        q.set_destination(dest).unwrap();
+        q.set_destination(DatagramAddress {
+            gid: [0; 16],
+            ..dest
+        })
+        .unwrap();
+        assert!(
+            q.set_destination(DatagramAddress {
+                gid: [0xff; 16],
+                ..dest
+            })
+            .is_err()
+        );
+        assert_eq!(p.count("ah_local"), 1);
+        assert_eq!(p.count("ah_global"), 1);
+    });
+}
+
+#[test]
 fn uncertain_srq_retains_receives_through_last_qp_and_failed_destroy() {
     case(
         "uncertain_srq_retains_receives_through_last_qp_and_failed_destroy",

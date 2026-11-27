@@ -63,6 +63,8 @@ pub(crate) struct QueueData {
     pub payload: crate::operation::PayloadQueue,
     pub route: Option<sys::shared::DatagramRoute>,
     pub srq: Option<crate::SharedReceiveQueue>,
+    // RTR may receive SRQ work even if the following RTS transition fails.
+    srq_exposed: bool,
     pub max_sge: u32,
     pub atomics: bool,
     pub windows: crate::window::Windows,
@@ -88,7 +90,14 @@ impl Cleanup for QueueData {
     fn cleanup(&mut self) -> std::result::Result<(), Fault> {
         #[cfg(feature = "tokio")]
         self.notifier.take();
-        if let Err(fault) = self.destroy_qp() {
+        let srq = self.srq.clone().filter(|_| self.srq_exposed);
+        let destroyed = match srq {
+            Some(pool) => pool
+                .detach(false, || self.destroy_qp())
+                .map_err(|_| Fault("detach shared receive queue", libc::EIO))?,
+            None => self.destroy_qp(),
+        };
+        if let Err(fault) = destroyed {
             self.payload.quarantine(fault);
             return Err(fault);
         }
@@ -185,6 +194,7 @@ impl Device {
             shared_cq,
             payload,
             srq,
+            srq_exposed: false,
             route: None,
             max_sge,
             atomics,
@@ -281,7 +291,7 @@ impl QueuePair {
     /// ```
     pub fn connect(&mut self, peer: &ConnectionParams) -> Result<()> {
         self.unconnected()?;
-        let data = self.owner.get()?;
+        let data = self.owner.get_mut()?;
         peer.validate(self.local.link)?;
         let port = data.domain.port;
         let (_, ctx, _) = data.domain.native()?;
@@ -289,6 +299,7 @@ impl QueuePair {
             return Err(Error::Invalid("selected route changed"));
         }
         let qp = data.qp.ok_or(Error::Closed)?;
+        data.srq_exposed = data.srq.is_some();
         if let Err(e) = data.api.connect(
             qp,
             sys::RcPath {
@@ -334,7 +345,24 @@ impl QueuePair {
     /// windows it resets the QP and detaches their keys before destroying the QP.
     /// The backing stays held through QP destruction and MR deregistration.
     /// A failed native teardown step is terminal.
+    /// An SRQ-attached RC QP returns Busy while a healthy pool has outstanding
+    /// receives. Drive their receiving QPs and retry. Dropping a connected QP
+    /// instead fences such a pool; its SRQ retains outstanding DMA loans until
+    /// their own CQEs or successful SRQ destruction.
     pub fn close(&mut self) -> Result<()> {
+        if let Some(pool) = self
+            .owner
+            .get()
+            .ok()
+            .filter(|q| q.srq_exposed)
+            .and_then(|q| q.srq.clone())
+        {
+            return pool.detach(true, || {
+                // Posting to this SRQ stays locked through native QP destruction.
+                self.owner.get_mut()?.srq_exposed = false;
+                self.owner.release().map(drop)
+            })?;
+        }
         self.owner.release().map(drop)
     }
 }

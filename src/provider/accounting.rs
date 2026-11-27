@@ -42,19 +42,27 @@ impl WorkNamespaces {
         }
     }
     pub fn work_id(&self, namespace: u64, slot: u64) -> Result<u64> {
-        if namespace == 0 || slot >= self.stride {
+        Self::encode(self.stride, namespace, slot)
+    }
+    /// Encode a slot for an externally owned lane using the same stride as its allocator.
+    pub fn encode(stride: u64, namespace: u64, slot: u64) -> Result<u64> {
+        if stride < 2 || namespace == 0 || slot >= stride {
             return Err(Error::Invalid("work namespace or slot"));
         }
         namespace
-            .checked_mul(self.stride)
+            .checked_mul(stride)
             .and_then(|base| base.checked_add(slot))
             .ok_or(Error::Invalid("work ID overflow"))
     }
     pub fn split(&self, id: u64) -> Result<(u64, u64)> {
-        if id < self.stride {
+        Self::decode(self.stride, id)
+    }
+    /// Decode an identity observed on an externally owned CQ.
+    pub fn decode(stride: u64, id: u64) -> Result<(u64, u64)> {
+        if stride < 2 || id < stride {
             return Err(Error::Invalid("reserved work namespace"));
         }
-        Ok((id / self.stride, id % self.stride))
+        Ok((id / stride, id % stride))
     }
 }
 

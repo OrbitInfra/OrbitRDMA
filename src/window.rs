@@ -111,7 +111,7 @@ impl QueuePair {
     ) -> Result<RemoteWindow> {
         let prepare = (|| {
             let queue = self.connected()?;
-            if queue.payload.used() || !queue.windows.is_empty() {
+            if queue.srq.is_some() || queue.payload.used() || !queue.windows.is_empty() {
                 return Err(Error::Busy);
             }
             let loan = memory.remote(&queue.domain, range, access)?;

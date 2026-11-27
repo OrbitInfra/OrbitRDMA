@@ -2,11 +2,11 @@
 
 OrbitRDMA is a Rust library for moving bytes between registered host buffers over Linux RDMA. It supports one-sided READ/WRITE and two-sided SEND/RECV on reliable connected (RC) queue pairs. The application chooses its control channel and decides which ranges to expose.
 
-The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.2` supports independent windows on a shared RC queue, batch submission and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
+The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.2.0` adds scatter/gather requests, shared queues, atomics, UD datagrams and an optional standard RDMA-CM transport for messages. [Development plan](docs/development-plan.md#delivery-order)
 
 ## Try device discovery
 
-Use stable Rust or Rust 1.85.0 on Linux. On Debian or Ubuntu, install `build-essential`, `libclang-dev` and `libibverbs-dev`. Add the dependency with `cargo add orbit-rdma@0.1`.
+Use stable Rust or Rust 1.85.0 on Linux. On Debian or Ubuntu, install `build-essential`, `libclang-dev` and `libibverbs-dev`. Add the dependency with `cargo add orbit-rdma@0.2`.
 
 ```rust
 fn main() -> Result<(), orbit_rdma::Error> {
@@ -21,7 +21,7 @@ The first call loads `libibverbs.so.1` and checks its host verbs exports. The pr
 
 ## Connect peers and register a buffer
 
-Open a device by name, port and GID index. Supply a 24-bit initial packet sequence number for each QP. On the development branch, both peers can use a connected TCP or Unix stream to exchange the two fixed 30-byte records and bring their local RC queues to RTS.
+Open a device by name, port and GID index. Supply a 24-bit initial packet sequence number for each QP. Both peers can use a connected TCP or Unix stream to exchange the two fixed 30-byte records and bring their local RC queues to RTS.
 
 ```rust
 #![forbid(unsafe_code)]
@@ -35,13 +35,13 @@ fn connect_peer(device: &Device, psn: u32, control: &mut TcpStream) -> Result<Qu
 }
 ```
 
-The application establishes peer identity and sets stream deadlines. After a failed or interrupted exchange, start a handshake on a fresh stream. To keep an existing control protocol, exchange `qp.parameters()` and call `qp.connect(&peer)` (also available in 0.1.2). The development branch also provides `RemoteDescriptor::to_bytes` and `from_bytes` for the 25-byte window records used by the 0.1.2 example. Publish a descriptor only after bind completion and coordinate remote use before revocation. [Two-process consumer](tests/package/host_peer.rs)
+The application establishes peer identity and sets stream deadlines. After a failed or interrupted exchange, start a handshake on a fresh stream. To keep an existing control protocol, exchange `qp.parameters()` and call `qp.connect(&peer)` (also available in 0.1.2). `orbit-rdma` also provides `RemoteDescriptor::to_bytes` and `from_bytes` for the 25-byte window records used by the 0.1.2 example. Publish a descriptor only after bind completion and coordinate remote use before revocation. [Two-process consumer](tests/package/host_peer.rs)
 
 `Device::register` accepts an owned `HostBuffer`. Use `HostBuffer::from_vec` to transfer a vector without copying, or `unsafe HostBuffer::from_external` to hand the crate an exclusive, stable host-memory loan. A local `read` or `write` guard keeps its registration alive. Overlapping reads can coexist. An overlapping writer or early deregistration returns `Error::Busy`.
 
 ## Keep a connection open across windows
 
-In 0.1.2, `QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
+`QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
 
 ```rust
 let mut a = qp.expose_window(&region, 0..4096, Permissions::RemoteWrite)?;
@@ -115,7 +115,7 @@ The [two-process advanced example](tests/package/advanced_peer.rs) checks scatte
 
 ## Platform and project boundary
 
-OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. On the development branch the crate compiles its production code entirely from Rust, including port-query dispatch and mlx5 protection-domain lookup. At build time bindgen reads the installed headers with libclang. At runtime the loader calls the host's libibverbs and NIC provider. The owned-buffer, connection and completion APIs can be used from a crate with `#![forbid(unsafe_code)]`. Native calls, DMA-backed memory access and caller-owned raw handles have explicit `unsafe` boundaries. CPU tests compile C fixtures against the public headers to check those boundaries. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
+OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. The crate compiles its production code entirely from Rust, including port-query dispatch and mlx5 protection-domain lookup. At build time bindgen reads the installed headers with libclang. At runtime the loader calls the host's libibverbs and NIC provider. The owned-buffer, connection and completion APIs can be used from a crate with `#![forbid(unsafe_code)]`. Native calls, DMA-backed memory access and caller-owned raw handles have explicit `unsafe` boundaries. CPU tests compile C fixtures against the public headers to check those boundaries. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
 
 The optional `provider` feature provides Linux port and GID inventory and bounded per-PD key history. It lets engines manage shared completion queues,
 protection domains, RC transitions, memory registrations and asynchronous device
