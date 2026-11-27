@@ -40,7 +40,22 @@ fn connect_peer(
 
 `Device::register` accepts an owned `HostBuffer`. Use `HostBuffer::from_vec` to transfer a vector without copying, or `unsafe HostBuffer::from_external` to hand the crate an exclusive, stable host-memory loan. A local `read` or `write` guard keeps its registration alive. Overlapping reads can coexist. An overlapping writer or early deregistration returns `Error::Busy`.
 
-To expose a range, call `qp.expose(&region, start..end, RemoteAccess::Read)` or request write access. Each window owns one connected QP. Poll `descriptor()` until the bind completion arrives, then send the descriptor to the connected peer. Poll `revoke()` until it returns `true`. At that point the window has retired, its QP has drained and the range can be borrowed again. A failed native destroy reports `Error::Unquiesced` and retains the affected resources and their charges. [Runnable packaged example](tests/package/connection.rs) · [CPU fault tests](tests/owners.rs)
+## Keep a connection open across windows
+
+On the development branch, `QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
+
+```rust
+let mut a = qp.expose_window(&region, 0..4096, Permissions::RemoteWrite)?;
+let b = qp.expose_window(&region, 4096..8192, Permissions::RemoteReadWrite)?;
+```
+
+Poll `window.descriptor(&mut qp, RemoteAccess::Write)` or request a read descriptor. Publish it to the connected peer when it returns `Some`. Each window has its own rkey. Both directional descriptors of a read/write window carry the same rkey, which grants both rights in hardware. Create a single-direction window to enforce narrower access.
+
+Once the peer finishes using A, poll `a.revoke(&mut qp)`. The call returns `true` after A's invalidate completion, MW deallocation and private MR deregistration. A's bytes can then be borrowed locally, and the peer can still READ and WRITE B on the original QP. Coordinate retirement with the peer because submitting work with a stale rkey can put the RC connection into error. Poll or use `qp.wait_for_progress(deadline)` between attempts. A deadline or a discarded window token leaves its loan with the QP.
+
+Each shared window consumes one MW and one additional registration for precisely the granted bytes. `Device::usage()` includes both in the configured limits. A provably unposted invalidation can be retried. An ambiguous post or an invalid completion fences new work until the queue is closed. A failed destructor returns `Error::Unquiesced` and retains the affected backing and budget. [Two-process example](tests/package/host_peer.rs) · [CPU lifetime tests](tests/unit/shared_windows.rs)
+
+The published 0.1.1 API `qp.expose(&region, range, access)` dedicates one QP to one window. Its `revoke()` also drains that QP. [Dedicated-window example](tests/package/connection.rs)
 
 ## Submit work and reuse a buffer
 
@@ -76,12 +91,27 @@ The optional `provider` feature provides Linux port and GID inventory and bounde
 protection domains, RC transitions, memory registrations and asynchronous device
 events. Native resources may be present after a failed create. The caller must
 retain those slots, their parents and the backing until successful retirement.
-The optional `mlx5` feature adds dma-buf MR registration and verified exact-range
-DevX keys. The application retains the export FD through deregistration.
+The optional `mlx5` feature currently gates the standard rdma-core dma-buf
+registration entry point as well as mlx5-specific DevX keys. Each RNIC driver
+must support importing the exported GPU allocation for the dma-buf route to work.
+The application retains the allocation and export FD through deregistration.
 
 OrbiTE uses these operations and `verbs::{post,poll}`. Its progress workers
 own scheduling, peer grants, cross-transport memory loans and CUDA exports.
 [OrbiTE integration](https://github.com/OrbitInfra/OrbiTE/pull/227)
+
+The host API selects a device, an active port and a GID index. Standard verbs
+handle RC, CQ, MR and MW operations through the installed driver. For RoCE, select
+a matching Ethernet GID type at both ends. For InfiniBand, the subnet manager
+configures the fabric and assigns LIDs. The peers exchange QP and path parameters
+over their control channel, then use the same Rust transfer API.
+[rdma-core providers](https://github.com/linux-rdma/rdma-core#supported-kernel-abis) · [InfiniBand subnet management](https://networking-docs.nvidia.com/nvidiainfinibandsecurityoverviewandguidelines/security-in-infiniband)
+
+OrbiTE's direct CUDA route exports a GPU allocation as dma-buf or selects a
+supported peer-memory driver. It owns CUDA ordering, GPU memory lifetime and
+the choice of direct or pinned-host staging. Its optional reusable GPU-source
+keys use mlx5 DevX. The safe multi-window API above accepts registered host memory.
+[OrbiTE GPU registration routes](https://github.com/OrbitInfra/OrbiTE/blob/main/docs/rdma-cuda.md#gpu-direct-registration-routes) · [NVIDIA GPUDirect RDMA](https://docs.nvidia.com/cuda/gpudirect-rdma/)
 
 ## Check two peers
 
@@ -94,7 +124,16 @@ target/release/examples/host_peer listen 0.0.0.0:7400 mlx5_0 1 0
 target/release/examples/host_peer connect 192.0.2.1:7400 mlx5_0 1 0
 ```
 
-Both processes check each transferred byte and the surrounding guards. TCP carries QP parameters, window descriptors and acknowledgements. READ, WRITE, SEND and RECV use the verbs provider. Linux CPU tests cover partial posts, delayed completions, failed cleanup and packaged consumers. Two-host RNIC qualification and performance measurements for this version are pending. [Two-peer consumer](tests/package/host_peer.rs) · [Verification plan](docs/development-plan.md#release-decision)
+Both processes use one RC QP apiece. The requester writes A and B, waits for the owner to revoke and reuse A, then reads B, overwrites it and reads it back. The same QP carries a final SEND/RECV. Both peers verify guard bytes. TCP carries connection parameters, window descriptors and acknowledgements. [Two-peer consumer](tests/package/host_peer.rs)
+
+For a single-host Soft-RoCE run, create an RXE device on the Linux host and select its active GID index. Give the Docker container the host network namespace, its `/dev/infiniband/uverbsN` device and sufficient locked memory. Inside the container, run the following for each installed toolchain. The runner starts two separate processes per repetition. Physical two-host RNIC and GPU profiles require their own installed runs. [Linux RXE setup](https://github.com/linux-rdma/rdma-core#software-rdma-drivers) · [Verification plan](docs/development-plan.md#release-decision)
+
+```sh
+for tc in stable 1.85.0; do
+    cargo +"$tc" build --locked --example host_peer
+    bash tests/peer-loopback.sh target/debug/examples/host_peer orbit_rxe 1 1 50
+done
+```
 
 ## License and provenance
 

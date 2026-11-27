@@ -47,13 +47,16 @@ impl<T: Cleanup> Owner<T> {
         self.data.as_ref()
     }
     pub(crate) fn release(&mut self) -> Result<Option<T>> {
+        self.retire().map_err(Fault::unquiesced)
+    }
+    pub(crate) fn retire(&mut self) -> std::result::Result<Option<T>, Fault> {
         if let Some(fault) = self.failed {
-            return Err(fault.unquiesced());
+            return Err(fault);
         }
         if let Some(data) = &mut self.data {
             if let Err(fault) = data.cleanup() {
                 self.failed = Some(fault);
-                return Err(fault.unquiesced());
+                return Err(fault);
             }
         }
         Ok(self.data.take())

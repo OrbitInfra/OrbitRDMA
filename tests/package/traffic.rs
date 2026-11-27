@@ -1,10 +1,23 @@
-use super::completion::{deadline, descriptor, finish};
+use super::completion::{deadline, finish};
 use orbit_rdma::{
     ConnectionParams, Device, HostBuffer, Limits, Permissions, QueueConfig, QueuePair,
-    RemoteAccess, Request, Transfer,
+    RemoteAccess, RemoteDescriptor, RemoteWindow, Request, Transfer,
 };
 use std::{error::Error, ffi::OsStr, time::Instant};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+fn descriptor(w: &mut RemoteWindow) -> Result<RemoteDescriptor> {
+    let limit = deadline();
+    loop {
+        if let Some(value) = w.descriptor()? {
+            return Ok(value);
+        }
+        if Instant::now() >= limit {
+            return Err("window bind timed out".into());
+        }
+        std::thread::yield_now();
+    }
+}
 
 fn connect(left: &Device, right: &Device) -> Result<(QueuePair, QueuePair)> {
     let mut a = left.queue_pair(QueueConfig {

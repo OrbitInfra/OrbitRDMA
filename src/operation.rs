@@ -10,7 +10,7 @@ use std::{
 };
 
 mod queue;
-pub(crate) use queue::PayloadQueue;
+pub(crate) use queue::{PayloadQueue, reserve_ids};
 
 /// One local range is one verbs work request.
 #[derive(Clone, Copy, Debug)]

@@ -9,8 +9,6 @@
 
 struct test_cq {
     struct ibv_cq cq;
-    struct ibv_wc wc;
-    int pending;
     struct ibv_wc data[256], last;
     unsigned head, count;
     int armed, fired;
@@ -27,9 +25,6 @@ struct receive_slot {
 struct test_qp {
     struct ibv_qp qp;
     int stage;
-    uint8_t *late;
-    uint64_t len;
-    uint32_t key;
     uint32_t peer;
     struct test_qp *next_qp;
     struct receive_slot receives[128];
@@ -38,19 +33,32 @@ struct test_qp {
 };
 struct test_mr {
     struct ibv_mr mr;
+    uint8_t *late;
     struct test_mr *next;
+};
+struct test_mw {
+    struct ibv_mw mw;
+    struct test_mw *next;
+    struct test_qp *qp;
+    struct test_mr *mr;
+    uint64_t address, length;
+    uint32_t key, access;
+    uint8_t *late;
+    int valid;
 };
 static struct test_qp *all_qps;
 static struct test_mr *all_mrs;
+static struct test_mw *all_mws;
 static uint32_t next_lkey = 31;
-/* This control observes one published window in the stale-descriptor test. */
-static struct test_qp *authority;
-static uint64_t bound_address, bound_length;
-static int writable;
+static struct test_mw *window_for(uint32_t qpn, uint32_t key) {
+    for (struct test_mw *w = all_mws; w; w = w->next)
+        if (w->valid && w->qp && w->qp->qp.qp_num == qpn && w->key == key) return w;
+    return NULL;
+}
 int orbit_allows(uint32_t qpn, uint32_t key, uint64_t address, uint64_t n, int write) {
-    return authority && authority->qp.qp_num == qpn && authority->key == key &&
-           (!!write == writable) && n && n <= bound_length && address >= bound_address &&
-           address - bound_address <= bound_length - n;
+    struct test_mw *w = window_for(qpn, key);
+    return w && (w->access & (write ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)) &&
+           n && n <= w->length && address >= w->address && address - w->address <= w->length - n;
 }
 static char first_fault[64], second_fault[64], option[64], history[262144];
 static size_t used;
@@ -82,19 +90,31 @@ static union ibv_gid port_gid(uint32_t port) {
 static struct ibv_mw *alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type) {
     if (event("alloc_mw") || type != IBV_MW_TYPE_2)
         return NULL;
-    struct ibv_mw *mw = calloc(1, sizeof(*mw));
-    if (!mw)
+    struct test_mw *w = calloc(1, sizeof(*w));
+    if (!w)
         return NULL;
+    struct ibv_mw *mw = &w->mw;
     mw->pd = pd;
     mw->context = pd->context;
     mw->type = type;
     mw->rkey = is("other_index") ? 0x5500 : 0x5400;
+    for (struct test_mw *live = all_mws; live; live = live->next)
+        if (live->mw.rkey >= mw->rkey) mw->rkey = live->mw.rkey + 0x100;
+    w->next = all_mws;
+    all_mws = w;
     return mw;
 }
 static int free_mw(struct ibv_mw *mw) {
     if (event("free_mw"))
         return EIO;
-    free(mw);
+    struct test_mw *w = (struct test_mw *)mw;
+    struct test_mw **it = &all_mws;
+    while (*it && *it != w) it = &(*it)->next;
+    if (!*it) return EINVAL;
+    *it = w->next;
+    /* Model a previously translated WRITE that still holds the target MR. */
+    if (w->late) w->mr->late = w->late;
+    free(w);
     return 0;
 }
 static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
@@ -103,9 +123,12 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
         return data_send(q, wr, bad);
     struct test_cq *cq = (struct test_cq *)base->send_cq;
     const int bind = wr->opcode == IBV_WR_BIND_MW;
-    if (q->stage != 3 || wr->next || wr->send_flags != IBV_SEND_SIGNALED ||
-        (!bind && wr->opcode != IBV_WR_LOCAL_INV) || cq->pending)
+    if (q->stage != 3 || wr->next || wr->send_flags != IBV_SEND_SIGNALED)
         return EINVAL;
+    if ((bind && is("reject_bind")) || (!bind && is("reject_invalidate"))) {
+        *bad = wr;
+        return ENOMEM;
+    }
     if (bind) {
         struct ibv_mw_bind_info *info = &wr->bind_mw.bind_info;
         struct ibv_mr *mr = info->mr;
@@ -113,29 +136,29 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
         if (wr->bind_mw.mw->pd != base->pd || mr->pd != base->pd || info->addr < start ||
             info->length == 0 || info->length > mr->length ||
             info->addr - start > mr->length - info->length ||
-            (info->mw_access_flags != IBV_ACCESS_REMOTE_READ &&
-             info->mw_access_flags != IBV_ACCESS_REMOTE_WRITE))
+            !(info->mw_access_flags & (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)) ||
+            (info->mw_access_flags & ~(IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)))
             return EINVAL;
-        q->key = wr->bind_mw.rkey;
-        authority = q;
-        bound_address = info->addr;
-        bound_length = info->length;
-        writable = info->mw_access_flags == IBV_ACCESS_REMOTE_WRITE;
-        if (info->mw_access_flags == IBV_ACCESS_REMOTE_WRITE) {
-            q->late = (uint8_t *)(uintptr_t)info->addr;
-            q->len = info->length;
-        }
+        struct test_mw *w = (struct test_mw *)wr->bind_mw.mw;
+        w->valid = 1;
+        w->qp = q;
+        w->mr = (struct test_mr *)mr;
+        w->key = wr->bind_mw.rkey;
+        w->address = info->addr;
+        w->length = info->length;
+        w->access = info->mw_access_flags;
+        if (w->access & IBV_ACCESS_REMOTE_WRITE)
+            w->late = (uint8_t *)(uintptr_t)(w->address + w->length - 1);
     } else {
-        if (!q->key || q->key != wr->invalidate_rkey)
-            return EINVAL;
-        if (authority == q)
-            authority = NULL;
+        struct test_mw *w = window_for(base->qp_num, wr->invalidate_rkey);
+        if (!w) return EINVAL;
+        w->valid = 0;
     }
-    cq->wc = (struct ibv_wc){.wr_id = wr->wr_id,
-                             .qp_num = base->qp_num,
-                             .status = IBV_WC_SUCCESS,
-                             .opcode = bind ? IBV_WC_BIND_MW : IBV_WC_LOCAL_INV};
-    cq->pending = 1;
+    struct ibv_wc wc = {.wr_id = wr->wr_id,
+                        .qp_num = base->qp_num,
+                        .status = IBV_WC_SUCCESS,
+                        .opcode = bind ? IBV_WC_BIND_MW : IBV_WC_LOCAL_INV};
+    enqueue(cq, wc);
     if (event(bind ? "bind" : "invalidate")) {
         *bad = NULL;
         return EIO;
@@ -148,15 +171,10 @@ static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
         return -EIO;
     if (n != 1)
         return -EINVAL;
-    if (cq->count) {
-        *wc = cq->data[cq->head++ % 256];
-        --cq->count;
-        return 1;
-    }
-    if (!cq->pending || is("delay"))
-        return 0;
-    *wc = cq->wc;
-    cq->pending = 0;
+    if (!cq->count || is("delay")) return 0;
+    *wc = cq->data[cq->head++ % 256];
+    --cq->count;
+    if (wc->opcode != IBV_WC_BIND_MW && wc->opcode != IBV_WC_LOCAL_INV) return 1;
     if (is("foreign_id"))
         ++wc->wr_id;
     if (is("foreign_qp"))
@@ -348,6 +366,7 @@ int ibv_dereg_mr(struct ibv_mr *m) {
         it = &(*it)->next;
     if (!*it)
         return EINVAL;
+    if ((*it)->late) *(*it)->late = 0xa5;
     *it = (*it)->next;
     free(m);
     return 0;
@@ -457,10 +476,13 @@ int ibv_destroy_qp(struct ibv_qp *base) {
     if (!*it)
         return EINVAL;
     *it = q->next_qp;
-    if (authority == q)
-        authority = NULL;
-    if (q->late && q->len)
-        q->late[q->len - 1] = 0xa5;
+    for (struct test_mw *w = all_mws; w; w = w->next) {
+        if (w->qp != q) continue;
+        if (w->late) *w->late = 0xa5;
+        w->late = NULL;
+        w->valid = 0;
+        w->qp = NULL;
+    }
     free(q);
     return 0;
 }

@@ -38,7 +38,7 @@ pub(crate) struct PayloadQueue {
     pending: Vec<Pending>,
     config: QueueConfig,
     used: bool,
-    fenced: bool,
+    pub(crate) fenced: bool,
     armed: bool,
     last_read: bool,
 }
@@ -195,7 +195,7 @@ impl Request {
 // even across QP incarnations with identical native numbers.
 static NEXT_ID: AtomicU64 = AtomicU64::new(3);
 
-fn reserve_ids(count: usize) -> Result<u64> {
+pub(crate) fn reserve_ids(count: usize) -> Result<u64> {
     let mut first = NEXT_ID.load(Ordering::Relaxed);
     loop {
         let next = first
@@ -209,6 +209,10 @@ fn reserve_ids(count: usize) -> Result<u64> {
 }
 
 impl QueueData {
+    pub(crate) fn send_capacity(&self, count: usize) -> Result<()> {
+        self.payload
+            .capacity(count.saturating_add(self.windows.pending()), false)
+    }
     fn post(
         &mut self,
         requests: &mut Vec<Request>,
@@ -218,7 +222,11 @@ impl QueueData {
         let qp = self.qp.ok_or(Error::Closed)?;
         let first = requests.first().ok_or(Error::Invalid("empty WR list"))?;
         let receive = matches!(first.transfer, Transfer::Receive);
-        self.payload.capacity(requests.len(), receive)?;
+        if receive {
+            self.payload.capacity(requests.len(), true)?;
+        } else {
+            self.send_capacity(requests.len())?;
+        }
         if requests
             .iter()
             .any(|r| matches!(r.transfer, Transfer::Receive) != receive)
@@ -334,7 +342,9 @@ impl QueueData {
             let Some(wc) = self.api.poll_one(cq)? else {
                 return Ok(count);
             };
-            self.payload.completion(qpn, wc)?;
+            if !self.windows.completion(qpn, wc)? {
+                self.payload.completion(qpn, wc)?;
+            }
         }
         Ok(32)
     }
@@ -343,7 +353,10 @@ impl QueueData {
         let ch = self.channel.ok_or(Error::Closed)?;
         loop {
             let n = self.progress(qpn)?;
-            if n != 0 || self.payload.pending.is_empty() || Instant::now() >= deadline {
+            if n != 0
+                || (self.payload.pending.is_empty() && self.windows.pending() == 0)
+                || Instant::now() >= deadline
+            {
                 return Ok(n);
             }
             if !self.payload.armed {

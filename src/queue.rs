@@ -59,6 +59,7 @@ pub(crate) struct QueueData {
     pub cq: Option<sys::Cq>,
     pub channel: Option<sys::Channel>,
     pub payload: crate::operation::PayloadQueue,
+    pub windows: crate::window::Windows,
     _permit: Permit,
 }
 impl Cleanup for QueueData {
@@ -68,12 +69,14 @@ impl Cleanup for QueueData {
             return Err(fault);
         }
         self.payload.drained();
+        let windows = self.windows.drain();
         sys::destroy(&mut self.cq, "ibv_destroy_cq", self.api.ibv_destroy_cq)?;
         sys::destroy(
             &mut self.channel,
             "ibv_destroy_comp_channel",
             self.api.ibv_destroy_comp_channel,
-        )
+        )?;
+        windows
     }
 }
 
@@ -113,6 +116,7 @@ impl Device {
             cq: None,
             channel: None,
             payload: crate::operation::PayloadQueue::new(config),
+            windows: Default::default(),
             _permit: domain.reserve(Charge::Queue)?,
         });
         let create = (|| {

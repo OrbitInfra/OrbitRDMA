@@ -1,5 +1,7 @@
 #[path = "support/provider.rs"]
 mod provider;
+#[path = "unit/shared_windows.rs"]
+mod shared_windows;
 #[path = "unit/transfers.rs"]
 mod transfers;
 use orbit_rdma::*;

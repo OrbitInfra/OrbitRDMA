@@ -158,12 +158,13 @@ static int data_send(struct test_qp *q, struct ibv_send_wr *wr, struct ibv_send_
         else {
             uint64_t address = wr->wr.rdma.remote_addr;
             int writing = wr->opcode == IBV_WR_RDMA_WRITE;
+            struct test_mw *window = window_for(q->peer, wr->wr.rdma.rkey);
             if (!orbit_allows(q->peer, wr->wr.rdma.rkey, address, s->length, writing) ||
-                authority->peer != q->qp.qp_num)
+                window->qp->peer != q->qp.qp_num)
                 wc.status = IBV_WC_REM_ACCESS_ERR;
             else if (writing) {
                 memcpy((void *)(uintptr_t)address, (const void *)(uintptr_t)s->addr, s->length);
-                authority->late = NULL;
+                window->late = NULL;
             } else
                 memcpy((void *)(uintptr_t)s->addr, (const void *)(uintptr_t)address, s->length);
         }

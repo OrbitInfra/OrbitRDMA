@@ -1,9 +1,12 @@
-//! A type-2B MW is scoped to its RC QP. The first implementation dedicates
-//! that QP to the window, giving revocation a terminal hardware drain receipt.
+//! A type-2B MW is scoped to its RC QP. Dedicated windows retire the QP.
+//! Shared windows retire their own MW and exact-range MR.
+mod shared;
 use crate::device::{Charge, Permit};
 use crate::memory::Loan;
 use crate::resource::{Cleanup, Fault, Owner, Result};
 use crate::{Error, QueuePair, RegisteredMemory, sys};
+pub use shared::SharedWindow;
+pub(crate) use shared::Windows;
 use std::ops::Range;
 
 /// Direction of the peer's access to this window.
@@ -92,7 +95,7 @@ impl QueuePair {
     ) -> Result<RemoteWindow> {
         let prepare = (|| {
             let queue = self.connected()?;
-            if queue.payload.used() {
+            if queue.payload.used() || !queue.windows.is_empty() {
                 return Err(Error::Busy);
             }
             let loan = memory.remote(&queue.domain, range, access)?;
