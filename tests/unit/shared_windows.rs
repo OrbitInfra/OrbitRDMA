@@ -577,3 +577,29 @@ fn failed_close_reset_or_window_detach_keeps_all_backing_and_payload() {
         },
     );
 }
+
+#[cfg(feature = "provider")]
+#[test]
+fn external_poller_routes_each_window_and_retains_failed_invalidation() {
+    use orbit_rdma::provider::SharedWindowControl;
+    let (mut a, mut b) = (
+        SharedWindowControl::default(),
+        SharedWindowControl::default(),
+    );
+    a.bind(9, 4).unwrap();
+    b.bind(9, 20).unwrap();
+    assert!(a.revoke(5).is_err());
+    assert!(a.complete(8, 4, 0, 5).is_err());
+    assert!(b.complete(9, 4, 0, 5).is_err());
+    b.complete(9, 20, 0, 5).unwrap();
+    a.complete(9, 4, 0, 5).unwrap();
+    a.revoke(7).unwrap();
+    assert!(!a.is_invalidated() && b.is_bound());
+    assert!(a.complete(9, 4, 0, 5).is_err());
+    a.complete(9, 7, 0, 6).unwrap();
+    assert!(a.is_invalidated() && b.is_bound());
+    b.revoke(23).unwrap();
+    assert!(b.complete(9, 23, 5, 0).is_err());
+    assert!(b.complete(9, 23, 0, 6).is_err());
+    assert!(!b.is_bound() && !b.is_invalidated());
+}

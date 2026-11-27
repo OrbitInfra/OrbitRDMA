@@ -2,7 +2,7 @@
 
 OrbitRDMA is a Rust library for moving bytes between registered host buffers over Linux RDMA. It supports one-sided READ/WRITE and two-sided SEND/RECV on reliable connected (RC) queue pairs. The application chooses its control channel and decides which ranges to expose.
 
-The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.1` supports batch submission, polling and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
+The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.1.2` supports independent windows on a shared RC queue, batch submission and completion-channel waits with a deadline. [Development plan](docs/development-plan.md#delivery-order)
 
 ## Try device discovery
 
@@ -42,7 +42,7 @@ fn connect_peer(
 
 ## Keep a connection open across windows
 
-In this checkout, `QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
+In 0.1.2, `QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
 
 ```rust
 let mut a = qp.expose_window(&region, 0..4096, Permissions::RemoteWrite)?;
@@ -57,7 +57,7 @@ Once the peer finishes using A, poll `a.revoke(&mut qp)`. The call returns `true
 
 Each shared window consumes one MW and one additional registration for precisely the granted bytes. `Device::usage()` includes both in the configured limits. A provably unposted invalidation can be retried. An ambiguous post or an invalid completion fences new work until the queue is closed. A failed destructor returns `Error::Unquiesced` and retains the affected backing and budget. [Two-process example](tests/package/host_peer.rs) · [CPU lifetime tests](tests/unit/shared_windows.rs)
 
-The published 0.1.1 API `qp.expose(&region, range, access)` dedicates one QP to one window. Its `revoke()` also drains that QP. [Dedicated-window example](tests/package/connection.rs)
+The dedicated-window API `qp.expose(&region, range, access)` dedicates one QP to one window. Its `revoke()` also drains that QP. [Dedicated-window example](tests/package/connection.rs)
 
 ## Submit work and reuse a buffer
 
@@ -98,7 +98,9 @@ registration entry point as well as mlx5-specific DevX keys. Each RNIC driver
 must support importing the exported GPU allocation for the dma-buf route to work.
 The application retains the allocation and export FD through deregistration.
 
-OrbiTE uses these operations and `verbs::{post,poll}`. Its progress workers
+Engines with an existing CQ poller can call `provider::prepare_shared_window` for a grant's exact host range. Feed that grant's signaled BIND and LOCAL_INV completions to `provider::SharedWindowControl`. It uses the same QP, work ID, opcode and status checks as `QueuePair::expose_window`. After successful LOCAL_INV, retire the MW and private MR before releasing the external DMA loan.
+
+OrbiTE uses these provider operations and `verbs::{post,poll}`. Its progress workers
 own scheduling, peer grants, cross-transport memory loans and CUDA exports.
 [OrbiTE integration](https://github.com/OrbitInfra/OrbiTE/pull/227)
 

@@ -10,6 +10,7 @@ mod device;
 pub mod inventory;
 mod memory;
 pub use crate::keys::KeyHistory;
+pub use crate::window::control::SharedWindowControl;
 #[cfg(feature = "mlx5")]
 pub mod mlx5;
 pub mod port;

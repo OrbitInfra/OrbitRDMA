@@ -1,5 +1,6 @@
 //! A type-2B MW is scoped to its RC QP. Dedicated windows retire the QP.
 //! Shared windows retire their own MW and exact-range MR.
+pub(crate) mod control;
 mod shared;
 use crate::device::{Charge, Permit};
 use crate::memory::Loan;
