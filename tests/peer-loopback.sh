@@ -24,7 +24,9 @@ trap cleanup EXIT
 for ((i=1; i<=count; i++)); do
     # Port zero lets the kernel choose a free port. The listener prints the
     # actual bound address before accepting its single control connection.
-    timeout 30 "$binary" listen 127.0.0.1:0 "$device" "$port" "$gid" >"$work/server" 2>&1 &
+    # Create an empty log before the parent starts checking readiness.
+    : >"$work/server"
+    timeout 30 "$binary" listen 127.0.0.1:0 "$device" "$port" "$gid" >>"$work/server" 2>&1 &
     server=$!
     address=
     for ((n=0; n<200; n++)); do
