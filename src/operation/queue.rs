@@ -172,7 +172,9 @@ impl PayloadQueue {
                 let received = tail.opcode == sys::DataOpcode::Receive;
                 let write_notice = received && opcode == sys::ffi::IBV_WC_RECV_RDMA_WITH_IMM;
                 if !tail.signaled
-                    || (self.datagram && received && (bytes < 40 || write_notice))
+                    || (self.datagram
+                        && received
+                        && (bytes < 40 || write_notice || entry.source_qp.is_none()))
                     || (!write_notice && opcode != tail.opcode.wc())
                     || (received
                         && flags & sys::ffi::IBV_WC_WITH_IMM != 0
@@ -198,11 +200,15 @@ impl PayloadQueue {
                         Immediate::Message(value)
                     }
                 });
-                let datagram = (self.datagram && received).then(|| DatagramReceipt {
-                    source_qp: entry.source_qp,
-                    has_grh: flags & sys::ffi::IBV_WC_GRH != 0,
-                    payload_bytes: bytes - 40,
-                });
+                let datagram =
+                    entry
+                        .source_qp
+                        .filter(|_| self.datagram && received)
+                        .map(|source_qp| DatagramReceipt {
+                            source_qp,
+                            has_grh: flags & sys::ffi::IBV_WC_GRH != 0,
+                            payload_bytes: bytes - 40,
+                        });
                 let tail_length = tail.length;
                 tail.finish(
                     Outcome::Success {
@@ -530,7 +536,7 @@ impl QueueData {
         let cq = self.cq.ok_or(Error::Closed)?;
         let pending = self.outstanding()?;
         if pending <= 1 {
-            if let Some(wc) = self.api.poll_entry(cq)? {
+            if let Some(wc) = self.api.poll_entry(cq, self.payload.datagram)? {
                 self.completion(qpn, wc)?;
                 return Ok(1);
             }
@@ -542,7 +548,7 @@ impl QueueData {
             .api
             .poll_batch(cq, &mut batch, pending.min(CompletionBatch::CAPACITY))?;
         let mut error = None;
-        for wc in batch.entries() {
+        for wc in batch.entries_for(self.payload.datagram) {
             // Polling consumed all entries. A malformed receipt must not lose a later
             // independent, valid completion. Its own unproven loans stay in the QP.
             if let Err(e) = self.completion(qpn, wc) {

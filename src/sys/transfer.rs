@@ -431,11 +431,11 @@ unsafe fn poll_into(cq: NonNull<c_void>, entries: &mut [ffi::ibv_wc]) -> Result<
 #[derive(Clone, Copy, Debug)]
 pub struct CompletionEntry {
     /// Source QPN field. Verbs defines this field only for a successful UD receive.
-    pub source_qp: u32,
+    pub source_qp: Option<u32>,
     pub work: WorkCompletion,
     pub immediate: Option<u32>,
 }
-fn decode_entry(wc: &ffi::ibv_wc) -> CompletionEntry {
+fn decode_entry(wc: &ffi::ibv_wc, datagram: bool) -> CompletionEntry {
     let immediate = if wc.status == ffi::IBV_WC_SUCCESS
         && wc.wc_flags & ffi::IBV_WC_WITH_IMM != 0
         && wc.wc_flags & ffi::IBV_WC_WITH_INV == 0
@@ -447,11 +447,8 @@ fn decode_entry(wc: &ffi::ibv_wc) -> CompletionEntry {
         None
     };
     CompletionEntry {
-        source_qp: if wc.status == ffi::IBV_WC_SUCCESS && wc.opcode == ffi::IBV_WC_RECV {
-            wc.src_qp
-        } else {
-            0
-        },
+        source_qp: (datagram && wc.status == ffi::IBV_WC_SUCCESS && wc.opcode == ffi::IBV_WC_RECV)
+            .then(|| wc.src_qp),
         work: decode(wc),
         immediate,
     }
@@ -474,10 +471,17 @@ pub unsafe fn poll(cq: NonNull<c_void>) -> Result<Option<WorkCompletion>, Error>
 ///
 /// The lifetime and dispatch requirements are identical to [`poll`].
 pub unsafe fn poll_entry(cq: NonNull<c_void>) -> Result<Option<CompletionEntry>, Error> {
+    // SAFETY: the caller retains the CQ. Generic polling reads only common RC/UD fields.
+    unsafe { poll_entry_for(cq, false) }
+}
+unsafe fn poll_entry_for(
+    cq: NonNull<c_void>,
+    datagram: bool,
+) -> Result<Option<CompletionEntry>, Error> {
     let mut wc = empty_wc();
     // SAFETY: the caller retains the CQ; this slice holds one writable entry.
     let count = unsafe { poll_into(cq, std::slice::from_mut(&mut wc)) }?;
-    Ok((count == 1).then(|| decode_entry(&wc)))
+    Ok((count == 1).then(|| decode_entry(&wc, datagram)))
 }
 
 /// Reusable storage for one provider poll. Iteration decodes only returned CQEs,
@@ -498,7 +502,15 @@ impl CompletionBatch {
     pub const CAPACITY: usize = 32;
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = CompletionEntry> + '_ {
-        self.entries[..self.len].iter().map(decode_entry)
+        self.entries_for(false)
+    }
+    pub(crate) fn entries_for(
+        &self,
+        datagram: bool,
+    ) -> impl ExactSizeIterator<Item = CompletionEntry> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .map(move |wc| decode_entry(wc, datagram))
     }
     pub fn iter(&self) -> impl ExactSizeIterator<Item = WorkCompletion> + '_ {
         self.entries[..self.len].iter().map(decode)
@@ -542,9 +554,9 @@ impl Native {
         unsafe { poll(cq.0.cast()) }
     }
 
-    pub(crate) fn poll_entry(&self, cq: Cq) -> RdmaResult<Option<CompletionEntry>> {
+    pub(crate) fn poll_entry(&self, cq: Cq, datagram: bool) -> RdmaResult<Option<CompletionEntry>> {
         // SAFETY: the owning queue retains the CQ and is its sole consumer.
-        unsafe { poll_entry(cq.0.cast()) }
+        unsafe { poll_entry_for(cq.0.cast(), datagram) }
     }
     pub(crate) fn poll_batch(
         &self,

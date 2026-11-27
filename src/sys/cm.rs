@@ -161,6 +161,7 @@ struct Connection {
     send: Cq,
     recv: Cq,
     pending: Option<Posted>,
+    flushing: bool,
 }
 impl Connection {
     fn receipt(&self) -> RdmaResult<Option<std::result::Result<usize, u32>>> {
@@ -206,21 +207,24 @@ impl Connection {
         Ok(Some(result))
     }
 }
-impl Cleanup for Connection {
-    fn cleanup(&mut self) -> std::result::Result<(), Fault> {
+impl Connection {
+    fn flush_until(&mut self, deadline: std::time::Instant) -> std::result::Result<bool, Fault> {
         if self.pending.is_none() {
-            return Ok(());
+            return Ok(true);
         }
-        self.verbs.error_state(self.qp)?;
+        if !self.flushing {
+            self.verbs.error_state(self.qp)?;
+            self.flushing = true;
+        }
         // Synchronous CM destroys its QP through a void API. Obtain the matching
         // success or flush CQE before deregistering. A missing receipt keeps every owner.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
         loop {
             match self.receipt() {
                 Ok(Some(_)) => break,
                 Ok(None) if std::time::Instant::now() < deadline => std::thread::yield_now(),
                 Err(Error::Native { operation, code }) => return Err(Fault(operation, code)),
-                _ => return Err(Fault("CM message not quiesced", libc::EBUSY)),
+                Ok(None) => return Ok(false),
+                Err(_) => return Err(Fault("malformed CM completion", libc::EPROTO)),
             }
         }
         let p = self
@@ -229,7 +233,16 @@ impl Cleanup for Connection {
             .ok_or(Fault("CM pending message", libc::EINVAL))?;
         destroy(&mut p.mr, "ibv_dereg_mr", self.verbs.ibv_dereg_mr)?;
         self.pending.take();
-        Ok(())
+        Ok(true)
+    }
+}
+impl Cleanup for Connection {
+    fn cleanup(&mut self) -> std::result::Result<(), Fault> {
+        if self.flush_until(std::time::Instant::now() + std::time::Duration::from_millis(2))? {
+            Ok(())
+        } else {
+            Err(Fault("CM message not quiesced", libc::EBUSY))
+        }
     }
 }
 /// A message recovered after a matching successful work completion and MR deregistration.
@@ -265,6 +278,7 @@ impl CmConnection {
             send,
             recv,
             pending: None,
+            flushing: false,
         })))
     }
     pub fn send(&mut self, bytes: Vec<u8>) -> RdmaResult<PostStatus> {
@@ -275,6 +289,9 @@ impl CmConnection {
     }
     fn post(&mut self, mut bytes: Vec<u8>, receive: bool) -> RdmaResult<PostStatus> {
         let d = self.0.get_mut()?;
+        if d.flushing {
+            return Err(Error::Closed);
+        }
         if d.pending.is_some() {
             return Err(Error::Busy);
         }
@@ -344,6 +361,21 @@ impl CmConnection {
             buffer: message.bytes,
             bytes: n,
         }))
+    }
+    /// Start QP flush and wait until the deadline. False keeps the same pending
+    /// message available for another drain attempt. A timeout never releases its buffer.
+    pub fn abort_until(&mut self, deadline: std::time::Instant) -> RdmaResult<bool> {
+        let mut done = false;
+        self.0
+            .cleanup_step(|d| {
+                done = d.flush_until(deadline)?;
+                Ok(())
+            })
+            .map_err(Fault::unquiesced)?;
+        if done {
+            self.0.release()?;
+        }
+        Ok(done)
     }
     /// Move the QP to ERR and collect a matching success or flush receipt before
     /// deregistration. Unproven drain keeps the native endpoint and backing together.

@@ -55,7 +55,9 @@ fn main() -> Result<()> {
     // Flush a posted receive without exposing it to another local user.
     if role == "listen" {
         q.receive(vec![0; 8])?;
-        q.abort()?;
+        if !q.abort_until(Instant::now() + Duration::from_secs(5))? {
+            return Err("CM flush deadline".into());
+        }
     } else {
         q.close()?;
     }
