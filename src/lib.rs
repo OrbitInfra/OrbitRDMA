@@ -14,6 +14,8 @@ compile_error!("orbit-rdma requires a Linux target and rdma-core development hea
 #[cfg(target_os = "linux")]
 mod device;
 #[cfg(target_os = "linux")]
+mod handshake;
+#[cfg(target_os = "linux")]
 mod keys;
 #[cfg(target_os = "linux")]
 mod memory;
@@ -85,6 +87,8 @@ pub enum Error {
     Load(LoadError),
     /// Device enumeration failed after the runtime had loaded.
     DeviceList(io::Error),
+    /// The caller's control stream failed during connection setup.
+    ControlIo(io::Error),
     DeviceNotFound(OsString),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -108,6 +112,7 @@ impl fmt::Display for Error {
         match self {
             Self::Load(error) => error.fmt(f),
             Self::DeviceList(error) => write!(f, "could not enumerate RDMA devices: {error}"),
+            Self::ControlIo(error) => write!(f, "RDMA control stream: {error}"),
             Self::DeviceNotFound(name) => write!(f, "RDMA device {name:?} was not found"),
             Self::Invalid(what) => write!(f, "invalid {what}"),
             Self::Unsupported(what) => write!(f, "provider does not support {what}"),
@@ -127,7 +132,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(match self {
             Self::Load(error) => error,
-            Self::DeviceList(error) => error,
+            Self::DeviceList(error) | Self::ControlIo(error) => error,
             _ => return None,
         })
     }

@@ -15,18 +15,29 @@ include = ["src/**", "tests/**", "build.rs", "Cargo.toml", "Cargo.lock", "README
 name = "host_peer"
 path = "tests/package/host_peer.rs"
 
+[[example]]
+name = "async_peer"
+path = "tests/package/async_peer.rs"
+required-features = ["tokio"]
+
 [features]
 default = []
 provider = []
 mlx5 = ["provider"]
+tokio = ["dep:tokio"]
 
 [dependencies]
 libloading = "0.8.9"
 libc = "0.2.191"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1.52.3", optional = true, features = ["net", "rt", "io-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio = { version = "1.52.3", features = ["net", "rt", "time"] }
+
 [build-dependencies]
 bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }
-cc = "1.9.0"
 
 [lints.rust]
 unsafe_code = "deny"

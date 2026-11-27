@@ -39,7 +39,7 @@ pub(crate) struct PayloadQueue {
     config: QueueConfig,
     used: bool,
     pub(crate) fenced: bool,
-    armed: bool,
+    pub(super) armed: bool,
     last_read: bool,
 }
 impl PayloadQueue {
@@ -348,22 +348,34 @@ impl QueueData {
         }
         Ok(32)
     }
-    fn wait(&mut self, qpn: u32, deadline: Instant) -> Result<usize> {
-        let cq = self.cq.ok_or(Error::Closed)?;
-        let ch = self.channel.ok_or(Error::Closed)?;
+    // A one-shot arm survives timeouts and dropped waiters. Poll again after
+    // arming so a completion between the first poll and the arm cannot be lost.
+    pub(super) fn poll_or_arm(
+        &mut self,
+        qpn: u32,
+        deadline: Option<Instant>,
+    ) -> Result<Option<usize>> {
         loop {
             let n = self.progress(qpn)?;
             if n != 0
                 || (self.payload.pending.is_empty() && self.windows.pending() == 0)
-                || Instant::now() >= deadline
+                || deadline.is_some_and(|end| Instant::now() >= end)
             {
-                return Ok(n);
+                return Ok(Some(n));
             }
-            if !self.payload.armed {
-                self.api.arm(cq)?;
-                self.payload.armed = true;
-                // Poll again after arming, covering the poll-to-arm race.
-                continue;
+            if self.payload.armed {
+                return Ok(None);
+            }
+            self.api.arm(self.cq.ok_or(Error::Closed)?)?;
+            self.payload.armed = true;
+        }
+    }
+    fn wait(&mut self, qpn: u32, deadline: Instant) -> Result<usize> {
+        let cq = self.cq.ok_or(Error::Closed)?;
+        let ch = self.channel.ok_or(Error::Closed)?;
+        loop {
+            if let Some(n) = self.poll_or_arm(qpn, Some(deadline))? {
+                return Ok(n);
             }
             if !self.api.wait_event(ch, cq, deadline)? {
                 return self.progress(qpn);

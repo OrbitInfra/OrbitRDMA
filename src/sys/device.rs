@@ -47,9 +47,9 @@ impl Native {
     }
     pub(crate) fn port(&self, ctx: Context, number: u8, index: u8) -> RdmaResult<Port> {
         let mut attr = ffi::ibv_port_attr::default();
-        // SAFETY: the bridge selects the extended ABI or calls this table's legacy export.
+        // SAFETY: the owner retains the provider and context throughout the query.
         check("ibv_query_port", unsafe {
-            ffi::orbit_query_port(ctx.0.as_ptr(), number, &mut attr, Some(self.ibv_query_port))
+            port::query(ctx.0.as_ptr(), number, &mut attr, Some(self.ibv_query_port))
         })?;
         if attr.state != ffi::IBV_PORT_ACTIVE || !(1..=5).contains(&attr.active_mtu) {
             return Err(Error::Invalid("inactive port or MTU"));

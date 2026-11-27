@@ -20,9 +20,9 @@ mkdir -p "$work/pkg" "$work/consumer/src" "$work/fixture" "$work/root"
 tar -xf "$archive" --strip-components=1 -C "$work/pkg"
 cp "$work/pkg/tests/package/probe.rs" "$work/consumer/src/main.rs"
 cp "$work/pkg/tests/package/connection.rs" "$work/consumer/src/"
-cp "$work/pkg/tests/package/"{traffic,completion,host_peer,host_peer_wire}.rs "$work/consumer/src/"
+cp "$work/pkg/tests/package/"{traffic,completion,host_peer,async_peer}.rs "$work/consumer/src/"
 cp "$work/pkg/Cargo.lock" "$work/consumer/"
-cargo test --offline --locked --manifest-path "$work/pkg/Cargo.toml" --test owners
+cargo test --offline --locked --all-features --manifest-path "$work/pkg/Cargo.toml" --test owners
 cat > "$work/consumer/Cargo.toml" <<'TOML'
 [package]
 name = "orbit-rdma-consumer"
@@ -33,14 +33,26 @@ edition = "2024"
 name = "host_peer"
 path = "src/host_peer.rs"
 
+[[bin]]
+name = "async_peer"
+path = "src/async_peer.rs"
+required-features = ["tokio"]
+
+[features]
+tokio = ["orbit-rdma/tokio", "dep:tokio"]
+
 [dependencies]
+tokio = { version = "1.52.3", optional = true, features = ["net", "rt", "time", "io-util"] }
 orbit-rdma = { path = "../pkg" }
 TOML
 
 # Adding this consumer changes the root package in the copied lockfile.
 (cd "$work/consumer" && cargo metadata --offline --format-version 1 \
     --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" >/dev/null)
-cargo build --manifest-path "$work/consumer/Cargo.toml" --offline --locked --target-dir "$work/build"
+# The linker and libclang are available. A native C/C++ build step would fail here.
+CC=false CXX=false cargo build --manifest-path "$work/consumer/Cargo.toml" --offline --locked --target-dir "$work/build"
+CC=false CXX=false cargo build --manifest-path "$work/consumer/Cargo.toml" --offline --locked --target-dir "$work/build" --features tokio --bin async_peer
+CC=false CXX=false cargo build --manifest-path "$work/pkg/Cargo.toml" --offline --locked --target-dir "$work/build" --all-features
 probe="$work/build/debug/orbit-rdma-consumer"
 dynamic=$(LC_ALL=C readelf -d "$probe")
 if [[ "$dynamic" == *libibverbs* ]]; then

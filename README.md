@@ -21,22 +21,21 @@ The first call loads `libibverbs.so.1` and checks its host verbs exports. The pr
 
 ## Connect peers and register a buffer
 
-Open a device by its exact name, physical port and GID index. Supply a 24-bit initial packet sequence number for each queue pair. Both peers call `connect` with the other's parameters. The application chooses its control channel and serialization.
+Open a device by name, port and GID index. Supply a 24-bit initial packet sequence number for each QP. On the development branch, both peers can use a connected TCP or Unix stream to exchange the two fixed 30-byte records and bring their local RC queues to RTS.
 
 ```rust
-use orbit_rdma::{ConnectionParams, Device, Error, QueueConfig, QueuePair};
+#![forbid(unsafe_code)]
+use orbit_rdma::{Device, Error, QueueConfig, QueuePair};
+use std::net::TcpStream;
 
-fn connect_peer(
-    device: &Device,
-    psn: u32,
-    exchange: impl FnOnce(ConnectionParams) -> Result<ConnectionParams, Error>,
-) -> Result<QueuePair, Error> {
+fn connect_peer(device: &Device, psn: u32, control: &mut TcpStream) -> Result<QueuePair, Error> {
     let mut qp = device.queue_pair(QueueConfig::new(psn))?;
-    let peer = exchange(qp.parameters())?;
-    qp.connect(&peer)?;
+    qp.connect_over(control)?;
     Ok(qp)
 }
 ```
+
+The application establishes peer identity and sets stream deadlines. After a failed or interrupted exchange, start a handshake on a fresh stream. To keep an existing control protocol, exchange `qp.parameters()` and call `qp.connect(&peer)` (also available in 0.1.2). The development branch also provides `RemoteDescriptor::to_bytes` and `from_bytes` for the 25-byte window records used by the 0.1.2 example. Publish a descriptor only after bind completion and coordinate remote use before revocation. [Two-process consumer](tests/package/host_peer.rs)
 
 `Device::register` accepts an owned `HostBuffer`. Use `HostBuffer::from_vec` to transfer a vector without copying, or `unsafe HostBuffer::from_external` to hand the crate an exclusive, stable host-memory loan. A local `read` or `write` guard keeps its registration alive. Overlapping reads can coexist. An overlapping writer or early deregistration returns `Error::Busy`.
 
@@ -85,9 +84,24 @@ Drive the QP with `progress()`, or call `op.wait_until(&mut qp, deadline)`. A ti
 
 `op.try_reclaim()` returns the original range and its outcome when ready, or a tracked handle while it is pending or unquiesced. Receive and READ destinations have exclusive loans. A WRITE or SEND source permits other readers. The checked-out range can safely be modified again after its last conflicting loan retires. [Packaged four-operation example](tests/package/traffic.rs) · [Failure and reuse tests](tests/unit/transfers.rs)
 
+## Wait with Tokio
+
+The development branch offers a `tokio` Cargo feature. It adds `connect_over_async` for an existing asynchronous stream, `QueuePair::wait_for_progress_async` for CQ progress (including window changes), and `Operation::wait_async` for one posted transfer. Enable I/O on the Tokio runtime.
+
+```rust
+use orbit_rdma::{Error, Operation, QueuePair, Reclaim};
+
+async fn reclaim(op: Operation, qp: &mut QueuePair) -> Result<Reclaim, Error> {
+    op.wait_async(qp).await?;
+    Ok(op.try_reclaim())
+}
+```
+
+A waiter polls the CQ, arms it and polls again before sleeping. The first wait that needs to sleep registers the completion channel with the Tokio reactor. Subsequent waits on that QP and runtime reuse the registration. Readiness wakes the task. Only a matching completion or successful teardown releases a DMA loan. A dropped future or an expired `tokio::time::timeout` leaves the operation on the QP. Resume with either the blocking or asynchronous progress API. The default feature set has no Tokio dependency. [Asynchronous peer](tests/package/async_peer.rs) · [Cancellation and race tests](tests/unit/async_progress.rs)
+
 ## Platform and project boundary
 
-OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. The loader calls the host's rdma-core runtime through a private function table. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
+OrbitRDMA uses Rust edition 2024 with an MSRV of 1.85. On the development branch the crate compiles its production code entirely from Rust, including port-query dispatch and mlx5 protection-domain lookup. At build time bindgen reads the installed headers with libclang. At runtime the loader calls the host's libibverbs and NIC provider. The owned-buffer, connection and completion APIs can be used from a crate with `#![forbid(unsafe_code)]`. Native calls, DMA-backed memory access and caller-owned raw handles have explicit `unsafe` boundaries. CPU tests compile C fixtures against the public headers to check those boundaries. Each supported RoCE or InfiniBand configuration will have its own two-host qualification record. [Linux RDMA userspace stack](https://github.com/linux-rdma/rdma-core)
 
 The optional `provider` feature provides Linux port and GID inventory and bounded per-PD key history. It lets engines manage shared completion queues,
 protection domains, RC transitions, memory registrations and asynchronous device
@@ -136,9 +150,11 @@ For a single-host Soft-RoCE run, create an RXE device on the Linux host and sele
 for tc in stable 1.85.0; do
     cargo +"$tc" build --locked --example host_peer
     bash tests/peer-loopback.sh target/debug/examples/host_peer orbit_rxe 1 1 50
+    cargo +"$tc" build --locked --features tokio --example async_peer
+    bash tests/peer-loopback.sh target/debug/examples/async_peer orbit_rxe 1 1 50
 done
 ```
 
 ## License and provenance
 
-OrbitRDMA is licensed under Apache-2.0. Its loader, port-query ABI bridge, RC transitions, host MR/window operations, key-history rules, WR prefix accounting and CQ retirement were adapted from OrbiTE commit `e4a12a20b4f47201c48f9e562aa5d95ea1db83e4`. The 25 required host exports and optional `ibv_query_port_speed` are resolved at runtime. [License](LICENSE) · [Extraction map](docs/development-plan.md#extraction-map) · [Original verbs code](https://github.com/OrbitInfra/OrbiTE/tree/e4a12a20b4f47201c48f9e562aa5d95ea1db83e4/src/transport/rdma/sys)
+OrbitRDMA is licensed under Apache-2.0. Its loader, port-query ABI handling, RC transitions, host MR/window operations, key-history rules, WR prefix accounting and CQ retirement were adapted from OrbiTE commit `e4a12a20b4f47201c48f9e562aa5d95ea1db83e4`. The 25 required host exports and optional `ibv_query_port_speed` are resolved at runtime. [License](LICENSE) · [Extraction map](docs/development-plan.md#extraction-map) · [Original verbs code](https://github.com/OrbitInfra/OrbiTE/tree/e4a12a20b4f47201c48f9e562aa5d95ea1db83e4/src/transport/rdma/sys)

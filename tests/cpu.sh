@@ -8,6 +8,7 @@ rustfmt --edition 2024 --check tests/package/probe.rs
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo clippy --locked --all-features --all-targets -- -D warnings
+cargo test --locked --features tokio --all-targets
 cargo test --locked --features provider
 cargo test --locked --all-features
 cargo test --locked --doc

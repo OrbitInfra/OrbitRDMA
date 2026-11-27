@@ -42,14 +42,30 @@ fn public_header_port_query_and_optional_symbol_preserve_fields_errors_and_units
     std::fs::create_dir(&dir).unwrap();
     let source = dir.join("port_abi.c");
     std::fs::write(&source, include_str!("port_abi.c")).unwrap();
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let speed_probe = dir.join("port_speed.c");
+    std::fs::write(&speed_probe,
+        "#include <infiniband/verbs.h>\nunsigned int speed(struct ibv_port_attr *a) { return a->active_speed_ex; }"
+    ).unwrap();
+    let speed_available = Command::new(&cc)
+        .arg("-fsyntax-only")
+        .arg(speed_probe)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert_eq!(cfg!(orbit_active_speed_ex), speed_available);
     for present in [false, true] {
         let library = dir.join(if present { "new.so" } else { "old.so" });
-        let mut command = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
+        let mut command = Command::new(&cc);
         command.args(["-shared", "-fPIC", "-Wall", "-Werror"]);
+        if cfg!(feature = "mlx5") {
+            command.arg("-DORBIT_TEST_MLX5");
+        }
         if present {
             command.arg("-DORBITE_WITH_PORT_SPEED");
         }
-        if env!("ORBIT_RDMA_ACTIVE_SPEED_EX") == "true" {
+        if cfg!(orbit_active_speed_ex) {
             command.arg("-DORBITE_HAVE_ACTIVE_SPEED_EX");
         }
         let output = command
@@ -66,6 +82,29 @@ fn public_header_port_query_and_optional_symbol_preserve_fields_errors_and_units
         // SAFETY: The test loads its freshly compiled fixture library, whose initializer and ABI
         // it controls.
         let library = unsafe { Library::new(&library) }.unwrap();
+        #[cfg(feature = "mlx5")]
+        {
+            type Init = unsafe extern "C" fn(*mut std::ffi::c_void, u64) -> c_int;
+            // SAFETY: the C fixture exports these signatures and lives through both calls.
+            unsafe {
+                let has_pd = library
+                    .get::<unsafe extern "C" fn() -> c_int>(b"orbit_has_mlx5_pd\0")
+                    .unwrap();
+                assert_eq!(has_pd() != 0, cfg!(orbit_mlx5dv_pd));
+                let init = *library.get::<Init>(b"orbit_test_mlx5_init\0").unwrap();
+                // The fixture checks the input PD for null and never dereferences it.
+                let mut token = 0u8;
+                let pd = std::ptr::from_mut(&mut token).cast();
+                assert_eq!(
+                    crate::provider::mlx5::pd_number(init, pd),
+                    cfg!(orbit_mlx5dv_pd).then_some(0x123456)
+                );
+                assert_eq!(
+                    crate::provider::mlx5::pd_number(init, std::ptr::null_mut()),
+                    None
+                );
+            }
+        }
         // SAFETY: The fixture exports this exact C signature, and the Library outlives its
         // symbol.
         let make_context = unsafe {
@@ -88,7 +127,7 @@ fn public_header_port_query_and_optional_symbol_preserve_fields_errors_and_units
             let attr = result.unwrap();
             assert_eq!((attr.state, attr.active_mtu, attr.gid_tbl_len), (4, 5, 17));
             assert_eq!((attr.lid, attr.link_layer, attr.active_width), (42, 2, 2));
-            let expected = if mode == 0 && env!("ORBIT_RDMA_ACTIVE_SPEED_EX") == "true" {
+            let expected = if mode == 0 && cfg!(orbit_active_speed_ex) {
                 800_000
             } else {
                 400_000
@@ -104,20 +143,22 @@ fn public_header_port_query_and_optional_symbol_preserve_fields_errors_and_units
             ) -> c_int>(b"orbite_test_legacy_query\0")
         }
         .unwrap();
-        // SAFETY: the fixture returns its live, non-extended context for mode 3.
-        let context = unsafe { make_context(3) };
-
-        assert_eq!(
-            // SAFETY: the context, callback and writable output remain alive during the call.
-            unsafe { query_with(context, 7, Some(*legacy)) }.map(|a| link_speed_mbps(&a)),
-            Ok(Some(400_000))
-        );
-
-        assert_eq!(
-            // SAFETY: the shim refuses an absent legacy callback before invoking native code.
-            unsafe { query_with(context, 7, None) }.err(),
-            Some(libc::ENOSYS)
-        );
+        // Exercise the legacy tag, an extended table with a null query callback,
+        // and an older table ending one byte before that callback is available.
+        for mode in [3, 4, 5] {
+            // SAFETY: all three contexts are retained by the fixture library.
+            let context = unsafe { make_context(mode) };
+            assert_eq!(
+                // SAFETY: the context, callback and output remain alive during dispatch.
+                unsafe { query_with(context, 7, Some(*legacy)) }.map(|a| link_speed_mbps(&a)),
+                Ok(Some(400_000))
+            );
+            assert_eq!(
+                // SAFETY: the fixture context is live and the legacy callback is absent.
+                unsafe { query_with(context, 7, None) }.err(),
+                Some(libc::ENOSYS)
+            );
+        }
         // SAFETY: the fixture exports the exact optional rate ABI and stays loaded.
         let query = unsafe { library.get::<QueryPortSpeed>(b"ibv_query_port_speed\0") }.ok();
         assert_eq!(query.is_some(), present);

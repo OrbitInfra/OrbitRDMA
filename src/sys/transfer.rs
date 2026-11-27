@@ -310,7 +310,7 @@ impl Native {
         check("ibv_req_notify_cq", unsafe { notify(cq.0.as_ptr(), 0) })
     }
 
-    pub(crate) fn wait_event(&self, ch: Channel, cq: Cq, deadline: Instant) -> RdmaResult<bool> {
+    fn nonblocking_fd(ch: Channel) -> RdmaResult<std::os::fd::RawFd> {
         // SAFETY: this dedicated channel retains the fd for the duration of the wait.
         let fd = unsafe { (*ch.0.as_ptr()).fd };
         if fd < 0 {
@@ -328,6 +328,22 @@ impl Native {
                 return Err(last_error("nonblocking completion channel"));
             }
         }
+        Ok(fd)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn notification_fd(ch: Channel) -> RdmaResult<std::os::fd::OwnedFd> {
+        let fd = Self::nonblocking_fd(ch)?;
+        // SAFETY: QueueData retains the private channel while we duplicate its fd.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        borrowed.try_clone_to_owned().map_err(|err| Error::Native {
+            operation: "duplicate completion channel fd",
+            code: err.raw_os_error().unwrap_or(libc::EIO),
+        })
+    }
+
+    pub(crate) fn wait_event(&self, ch: Channel, cq: Cq, deadline: Instant) -> RdmaResult<bool> {
+        let fd = Self::nonblocking_fd(ch)?;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -359,11 +375,21 @@ impl Native {
                     code: libc::EIO,
                 });
             }
+            if self.consume_event(ch, cq)? {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// The caller has set O_NONBLOCK. Another readiness edge may arrive after EAGAIN.
+    pub(crate) fn consume_event(&self, ch: Channel, cq: Cq) -> RdmaResult<bool> {
+        loop {
             let (mut got, mut context) = (std::ptr::null_mut(), std::ptr::null_mut());
             // SAFETY: both outputs are writable, and no other poller consumes this channel.
             if unsafe { (self.ibv_get_cq_event)(ch.0.as_ptr(), &mut got, &mut context) } != 0 {
                 match io::Error::last_os_error().kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => return Ok(false),
+                    io::ErrorKind::Interrupted => continue,
                     _ => return Err(last_error("ibv_get_cq_event")),
                 }
             }
