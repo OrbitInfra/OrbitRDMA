@@ -6,8 +6,8 @@ use crate::device::{Charge, Permit};
 use crate::memory::Loan;
 use crate::resource::{Cleanup, Fault, Owner, Result};
 use crate::{Error, QueuePair, RegisteredMemory, sys};
-pub use shared::SharedWindow;
 pub(crate) use shared::Windows;
+pub use shared::{AtomicTarget, AtomicWindow, SharedWindow};
 use std::ops::Range;
 
 /// Direction of the peer's access to this window.
@@ -111,7 +111,7 @@ impl QueuePair {
     ) -> Result<RemoteWindow> {
         let prepare = (|| {
             let queue = self.connected()?;
-            if queue.payload.used() || !queue.windows.is_empty() {
+            if queue.srq.is_some() || queue.payload.used() || !queue.windows.is_empty() {
                 return Err(Error::Busy);
             }
             let loan = memory.remote(&queue.domain, range, access)?;
@@ -152,7 +152,7 @@ impl QueuePair {
                 key,
                 Some(sys::Bind {
                     mw,
-                    mr: loan.mr()?,
+                    mr: loan.mr(),
                     address: loan.address(),
                     length: loan.length,
                     access,

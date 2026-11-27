@@ -692,3 +692,425 @@ fn admission_limits_stale_incarnations_and_cross_thread_loans() {
         },
     );
 }
+
+#[test]
+fn single_post_preserves_range_and_charges_across_native_failures() {
+    case(
+        "single_post_preserves_range_and_charges_across_native_failures",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            let mut q = conn(&d);
+            let request = Request::new(m.range(1..7).unwrap(), Transfer::Receive);
+            p.post_result(0, 0);
+            let rejected = q.submit_one(request).err().unwrap();
+            assert_eq!(rejected.request.buffer.bounds(), 1..7);
+            assert_eq!(d.usage().unwrap().range_loans, 0);
+            p.post_result(0, 2);
+            let posted = q.submit_one(rejected.request).unwrap();
+            assert_eq!(posted.status, PostStatus::Uncertain { code: libc::ENOMEM });
+            assert!(!posted.operation.is_reusable());
+            drop(posted.operation);
+            assert!(matches!(m.read(1..7), Err(Error::Busy)));
+            assert_eq!(q.progress().unwrap(), 0);
+            let used = d.usage().unwrap();
+            assert_eq!(
+                (
+                    used.receive_requests,
+                    used.range_loans,
+                    used.in_flight_bytes
+                ),
+                (1, 1, 6)
+            );
+            q.close().unwrap();
+            let used = d.usage().unwrap();
+            assert_eq!(
+                (
+                    used.receive_requests,
+                    used.range_loans,
+                    used.in_flight_bytes
+                ),
+                (0, 0, 0)
+            );
+            assert!(m.write(1..7).is_ok());
+        },
+    );
+}
+
+#[test]
+fn batch_dispatch_after_malformed_and_impossible_counts() {
+    case(
+        "batch_dispatch_after_malformed_and_impossible_counts",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let m = d.register(bytes(16), Permissions::Local).unwrap();
+            let mut q = conn(&d);
+            let n = q.parameters().qpn;
+            let ops = q
+                .submit(batch(&m, Transfer::Receive, &[0, 2, 4]))
+                .unwrap()
+                .operations;
+            p.emit(n, ops[0].id(), n + 1, (128, 2, 0), None);
+            p.emit(n, ops[1].id(), n, (128, 2, 0), None);
+            p.emit(n, ops[2].id(), n, (u32::MAX, u32::MAX, 7), Some(42));
+            p.option("overreported_poll");
+            assert!(q.progress().is_err());
+            assert!(ops.iter().all(|op| !op.is_reusable()));
+            p.option("manual");
+            let polls = p.count("poll");
+            assert!(q.progress().is_err());
+            assert_eq!(p.count("poll"), polls + 1);
+            assert!(!ops[0].is_reusable());
+            assert_eq!(ops[1].outcome(), Some(success(2)));
+            assert!(matches!(ops[2].outcome(), Some(Outcome::Failed { .. })));
+            assert!(m.write(2..6).is_ok());
+            assert!(matches!(m.read(0..2), Err(Error::Busy)));
+            p.emit(n, ops[0].id(), n, (128, 2, 0), None);
+            let polls = p.count("poll");
+            assert_eq!(q.progress().unwrap(), 1);
+            assert_eq!(p.count("poll"), polls + 1);
+            assert_eq!(d.usage().unwrap().range_loans, 0);
+        },
+    );
+}
+
+#[test]
+fn scatter_retains_all_ranges_and_one_work_credit() {
+    case("scatter_retains_all_ranges_and_one_work_credit", |p| {
+        p.option("manual");
+        let d = device();
+        let m = d.register(bytes(24), Permissions::Local).unwrap();
+        let mut q = d.queue_pair_with_sge(QueueConfig::new(42), 3).unwrap();
+        let mut peer = q.parameters();
+        peer.qpn += 1;
+        q.connect(&peer).unwrap();
+        let ranges = [
+            m.range(0..4).unwrap(),
+            m.range(8..12).unwrap(),
+            m.range(16..20).unwrap(),
+        ];
+        let bad = [ranges[0].clone(), ranges[0].clone()];
+        assert!(matches!(
+            q.submit_vectored(&bad, Transfer::Receive),
+            Err(Error::Busy)
+        ));
+        assert_eq!(d.usage().unwrap().range_loans, 0);
+        let pending = q.submit_vectored(&ranges, Transfer::Receive).unwrap();
+        let usage = d.usage().unwrap();
+        assert_eq!(
+            (
+                usage.receive_requests,
+                usage.range_loans,
+                usage.in_flight_bytes
+            ),
+            (1, 3, 12)
+        );
+        pending.receipt().cancel();
+        drop(pending);
+        assert!(ranges.iter().all(|r| matches!(r.read(), Err(Error::Busy))));
+        assert!(m.write(4..8).is_ok());
+        q.close().unwrap();
+        assert!(ranges.iter().all(|r| r.write().is_ok()));
+        assert_eq!(d.usage().unwrap().receive_requests, 0);
+    });
+}
+
+#[test]
+fn atomic_unknown_post_and_window_permissions() {
+    case("atomic_unknown_post_and_window_permissions", |p| {
+        let d = device();
+        let m = d.register(bytes(32), Permissions::Local).unwrap();
+        let mut q = d.atomic_queue_pair(QueueConfig::new(24), 1).unwrap();
+        let mut peer = q.parameters();
+        peer.qpn += 1;
+        q.connect(&peer).unwrap();
+        assert!(matches!(
+            q.expose_atomic_window(&m, 0..8),
+            Err(Error::PermissionDenied)
+        ));
+        let target = AtomicTarget {
+            qpn: peer.qpn,
+            address: 4096,
+            length: 16,
+            rkey: 7,
+        };
+        let slot = m.range(8..16).unwrap();
+        p.option("manual");
+        assert!(
+            q.submit_atomic(&slot, target, 1, AtomicOperation::FetchAdd(1))
+                .is_err()
+        );
+        assert_eq!(p.count("post_send"), 0);
+        p.post_result(0, 2);
+        let one = q
+            .submit_atomic(
+                &slot,
+                target,
+                8,
+                AtomicOperation::CompareSwap {
+                    compare: 1,
+                    swap: 3,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            one.operation.outcome(),
+            Some(Outcome::Failed {
+                remote_effect_unknown: true,
+                ..
+            })
+        ));
+        assert!(matches!(slot.read(), Err(Error::Busy)));
+        q.close().unwrap();
+        assert!(slot.write().is_ok());
+    });
+}
+
+#[test]
+fn retained_receipt_never_observes_reused_state() {
+    case("retained_receipt_never_observes_reused_state", |p| {
+        p.option("manual");
+        let d = device();
+        let m = d.register(bytes(8), Permissions::Local).unwrap();
+        let mut q = conn(&d);
+        let n = q.parameters().qpn;
+        let post = |q: &mut QueuePair| {
+            q.submit_one(Request::new(m.range(0..2).unwrap(), Transfer::Send))
+                .unwrap()
+                .operation
+        };
+        let old = post(&mut q);
+        p.emit(n, old.id(), n, (0, 0, 0), None);
+        q.progress().unwrap();
+        let next = post(&mut q);
+        next.cancel();
+        assert_eq!(old.outcome(), Some(success(2)));
+        assert!(old.is_reusable());
+        assert!(!next.is_reusable());
+        drop(old);
+        q.close().unwrap();
+        assert!(next.is_reusable());
+    });
+}
+
+#[test]
+fn shared_cq_routes_interleaved_qps_and_rejects_stale_receipts() {
+    case(
+        "shared_cq_routes_interleaved_qps_and_rejects_stale_receipts",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            let config = QueueConfig {
+                send_depth: 2,
+                receive_depth: 2,
+                ..QueueConfig::new(1)
+            };
+            let mut group = d.completion_group(8).unwrap();
+            let a = group.add(config).unwrap();
+            let b = group.add(config).unwrap();
+            assert!(group.add(config).is_err());
+            let (pa, pb) = (group.parameters(a).unwrap(), group.parameters(b).unwrap());
+            group.connect(a, &pb).unwrap();
+            group.connect(b, &pa).unwrap();
+            let post = |g: &mut CompletionGroup, id, r| {
+                g.submit_one(id, Request::new(m.range(r).unwrap(), Transfer::Receive))
+                    .unwrap()
+                    .operation
+            };
+            let x = post(&mut group, a, 0..2);
+            let y = post(&mut group, b, 2..4);
+            p.emit(pb.qpn, x.id(), pb.qpn, (128, 1, 0), None);
+            p.emit(pb.qpn, y.id(), pb.qpn, (128, 2, 0), None);
+            assert!(group.progress().is_err());
+            assert!(!x.is_reusable());
+            assert!(y.is_reusable());
+            assert!(matches!(m.read(0..2), Err(Error::Busy)));
+            group.close_queue(b).unwrap();
+            assert!(group.parameters(b).is_err());
+            p.emit(pa.qpn, x.id(), pa.qpn, (128, 1, 0), None);
+            assert_eq!(group.progress().unwrap(), 1);
+            assert_eq!(x.outcome(), Some(success(1)));
+            group.close().unwrap();
+            assert_eq!(p.count("free_cq"), 1);
+        },
+    );
+}
+
+#[test]
+fn srq_close_preserves_unread_cqe_and_sibling_capacity() {
+    case("srq_close_preserves_unread_cqe_and_sibling_capacity", |p| {
+        let d = device();
+        let memory = d.register(bytes(8), Permissions::Local).unwrap();
+        let mut pool = d.shared_receive_queue(1).unwrap();
+        let attach = || {
+            let mut q = d
+                .queue_pair_with_srq(QueueConfig::new(12), 1, &pool)
+                .unwrap();
+            let mut peer = q.parameters();
+            peer.qpn += 10;
+            q.connect(&peer).unwrap();
+            q
+        };
+        let (mut a, mut b, mut c) = (attach(), attach(), attach());
+        let first = pool.post(&memory.range(0..4).unwrap()).unwrap().operation;
+        let qpn = a.parameters().qpn;
+        p.emit(qpn, first.id(), qpn, (128, 3, 0), None);
+        assert!(matches!(a.close(), Err(Error::Busy)));
+        assert!(!first.is_reusable());
+        assert_eq!(a.progress().unwrap(), 1);
+        a.close().unwrap();
+        let second = pool.post(&memory.range(0..4).unwrap()).unwrap().operation;
+        let qpn = b.parameters().qpn;
+        p.emit(qpn, second.id(), qpn, (128, 4, 0), None);
+        b.progress().unwrap();
+        assert_eq!(ready(second).outcome, success(4));
+        let lost = pool.post(&memory.range(0..4).unwrap()).unwrap().operation;
+        drop(b);
+        assert!(!lost.is_reusable());
+        assert!(matches!(
+            pool.post(&memory.range(4..8).unwrap()),
+            Err(Error::Closed)
+        ));
+        c.close().unwrap();
+        assert!(matches!(memory.write(0..4), Err(Error::Busy)));
+        pool.close().unwrap();
+        assert!(lost.is_reusable());
+        assert!(matches!(lost.try_reclaim(), Reclaim::Ready(_)));
+    });
+}
+
+#[test]
+fn failed_srq_qp_destroy_fences_future_receives() {
+    case("failed_srq_qp_destroy_fences_future_receives", |p| {
+        let d = device();
+        let m = d.register(bytes(4), Permissions::Local).unwrap();
+        let mut s = d.shared_receive_queue(1).unwrap();
+        let mut q = d.queue_pair_with_srq(QueueConfig::new(12), 1, &s).unwrap();
+        let peer = q.parameters();
+        q.connect(&peer).unwrap();
+        p.fault("free_qp", "");
+        assert!(matches!(q.close(), Err(Error::Unquiesced { .. })));
+        assert!(matches!(
+            s.post(&m.range(0..4).unwrap()),
+            Err(Error::Closed)
+        ));
+        assert_eq!(p.count("post_srq"), 0);
+    });
+}
+
+#[test]
+fn srq_private_window_and_provider_specific_caps() {
+    case("srq_private_window_and_provider_specific_caps", |p| {
+        let d = device();
+        let m = d.register(bytes(8), Permissions::RemoteRead).unwrap();
+        let s = d.shared_receive_queue(150).unwrap();
+        assert!(d.shared_receive_queue(161).is_err());
+        let mut q = d.queue_pair_with_srq(QueueConfig::new(1), 2, &s).unwrap();
+        let peer = q.parameters();
+        q.connect(&peer).unwrap();
+        let remote = RemoteDescriptor {
+            qpn: peer.qpn,
+            address: 64,
+            rkey: 3,
+            length: 8,
+            access: RemoteAccess::Read,
+        };
+        assert!(matches!(
+            q.submit_vectored(
+                &[m.range(0..2).unwrap(), m.range(4..6).unwrap()],
+                Transfer::Read { remote, offset: 0 }
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(p.count("sq_wr"), 0);
+        assert!(matches!(
+            q.expose(&m, 0..4, RemoteAccess::Read),
+            Err(Error::Busy)
+        ));
+        assert_eq!(p.count("alloc_mw"), 0);
+    });
+}
+
+#[test]
+fn ud_infiniband_accepts_lid_or_unicast_global_route() {
+    case("ud_infiniband_accepts_lid_or_unicast_global_route", |p| {
+        let d = Device::open("cpu-first", 2, 1, Limits::default()).unwrap();
+        let mut q = d.datagram_queue(QueueConfig::new(1), 3).unwrap();
+        let dest = q.address();
+        q.set_destination(dest).unwrap();
+        q.set_destination(DatagramAddress {
+            gid: [0; 16],
+            ..dest
+        })
+        .unwrap();
+        assert!(
+            q.set_destination(DatagramAddress {
+                gid: [0xff; 16],
+                ..dest
+            })
+            .is_err()
+        );
+        assert_eq!(p.count("ah_local"), 1);
+        assert_eq!(p.count("ah_global"), 1);
+    });
+}
+
+#[test]
+fn uncertain_srq_retains_receives_through_last_qp_and_failed_destroy() {
+    case(
+        "uncertain_srq_retains_receives_through_last_qp_and_failed_destroy",
+        |p| {
+            let d = device();
+            let other = device();
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            let mut srq = d.shared_receive_queue(3).unwrap();
+            let config = QueueConfig::new(12);
+            assert!(other.queue_pair_with_srq(config, 1, &srq).is_err());
+            let mut q = d.queue_pair_with_srq(config, 1, &srq).unwrap();
+            assert!(matches!(srq.close(), Err(Error::Busy)));
+            p.option("uncertain_srq");
+            let op = srq.post(&m.range(0..8).unwrap()).unwrap();
+            assert!(matches!(op.status, PostStatus::Uncertain { .. }));
+            q.close().unwrap();
+            assert!(!op.operation.is_reusable());
+            assert!(m.read(0..8).is_err());
+            p.fault("destroy_srq", "");
+            assert!(matches!(srq.close(), Err(Error::Unquiesced { .. })));
+            assert!(matches!(
+                op.operation.try_reclaim(),
+                Reclaim::Unquiesced { .. }
+            ));
+            drop(srq);
+            assert_eq!(p.count("destroy_srq"), 1);
+            assert_eq!(d.shared_queue_usage().unwrap().receive_queues, 1);
+        },
+    );
+}
+
+#[test]
+fn ud_address_outlives_delayed_send_and_failed_qp_destructor() {
+    case(
+        "ud_address_outlives_delayed_send_and_failed_qp_destructor",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let m = d.register(bytes(64), Permissions::Local).unwrap();
+            let mut q = d.datagram_queue(QueueConfig::new(1), 3).unwrap();
+            let dest = q.address();
+            q.set_destination(dest).unwrap();
+            assert!(q.receive(&m.range(0..39).unwrap()).is_err());
+            let op = q.send(&m.range(0..3).unwrap()).unwrap();
+            assert!(matches!(q.set_destination(dest), Err(Error::Busy)));
+            p.fault("free_qp", "");
+            assert!(matches!(q.close(), Err(Error::Unquiesced { .. })));
+            assert!(!op.operation.is_reusable());
+            drop(q);
+            assert_eq!(p.count("destroy_ah"), 0);
+            assert_eq!(p.count("free_qp"), 1);
+            assert!(matches!(m.write(0..1), Err(Error::Busy)));
+        },
+    );
+}

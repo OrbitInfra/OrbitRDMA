@@ -75,13 +75,22 @@ pub struct Usage {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Charge {
+    SharedReceiveQueue,
+    SharedCompletionQueue,
     Payload { bytes: usize, receive: bool },
     Queue,
     Region(usize),
     Window,
     Range,
 }
+/// Additional shared queues charged to the protection domain's queue budget.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedQueueUsage {
+    pub receive_queues: usize,
+    pub completion_queues: usize,
+}
 struct Ledger {
+    shared: SharedQueueUsage,
     usage: Usage,
     keys: KeyHistory,
 }
@@ -96,9 +105,12 @@ pub(crate) struct Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         let mut ledger = lock(&self.book);
-        let u = &mut ledger.usage;
+        let Ledger {
+            usage: u, shared, ..
+        } = &mut *ledger;
         match self.charge {
             Charge::Payload { bytes, receive } => {
+                u.range_loans -= 1;
                 u.in_flight_bytes -= bytes;
                 if receive {
                     u.receive_requests -= 1;
@@ -107,6 +119,8 @@ impl Drop for Permit {
                 }
             }
             Charge::Queue => u.queue_pairs -= 1,
+            Charge::SharedReceiveQueue => shared.receive_queues -= 1,
+            Charge::SharedCompletionQueue => shared.completion_queues -= 1,
             Charge::Region(n) => {
                 u.regions -= 1;
                 u.registered_bytes -= n;
@@ -145,12 +159,16 @@ impl Domain {
     }
     pub(crate) fn reserve(&self, charge: Charge) -> Result<Permit> {
         let mut ledger = lock(&self.ledger);
-        let u = &mut ledger.usage;
+        let Ledger {
+            usage: u, shared, ..
+        } = &mut *ledger;
         let l = self.limits;
         match charge {
             Charge::Payload { bytes, receive }
-                if bytes <= l.in_flight_bytes - u.in_flight_bytes =>
+                if u.range_loans < l.range_loans
+                    && bytes <= l.in_flight_bytes - u.in_flight_bytes =>
             {
+                u.range_loans += 1;
                 u.in_flight_bytes += bytes;
                 if receive {
                     u.receive_requests += 1;
@@ -158,7 +176,24 @@ impl Domain {
                     u.send_requests += 1;
                 }
             }
-            Charge::Queue if u.queue_pairs < l.queue_pairs => u.queue_pairs += 1,
+            Charge::SharedCompletionQueue
+                if u.queue_pairs + shared.receive_queues + shared.completion_queues
+                    < l.queue_pairs =>
+            {
+                shared.completion_queues += 1
+            }
+            Charge::SharedReceiveQueue
+                if u.queue_pairs + shared.receive_queues + shared.completion_queues
+                    < l.queue_pairs =>
+            {
+                shared.receive_queues += 1
+            }
+            Charge::Queue
+                if u.queue_pairs + shared.receive_queues + shared.completion_queues
+                    < l.queue_pairs =>
+            {
+                u.queue_pairs += 1
+            }
             Charge::Region(n)
                 if u.regions < l.regions && n <= l.registered_bytes - u.registered_bytes =>
             {
@@ -221,6 +256,7 @@ impl Device {
                 port,
                 limits,
                 ledger: Arc::new(Mutex::new(Ledger {
+                    shared: Default::default(),
                     usage: Usage::default(),
                     keys: KeyHistory::new(limits.key_indices),
                 })),
@@ -236,6 +272,9 @@ impl Device {
     /// Returns current charges, including key indices ever used in this domain.
     pub fn usage(&self) -> Result<Usage> {
         Ok(lock(&self.domain()?.ledger).usage)
+    }
+    pub fn shared_queue_usage(&self) -> Result<SharedQueueUsage> {
+        Ok(lock(&self.domain()?.ledger).shared)
     }
     /// Returns Busy while any live or quarantined child retains this PD.
     pub fn close(&mut self) -> Result<()> {

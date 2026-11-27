@@ -1,4 +1,5 @@
 use super::*;
+use crate::sys;
 // The protocol grants only READ/WRITE authority, including on atomic-capable hardware.
 pub fn grant_access(permission: u32) -> u32 {
     let mut access = 0;
@@ -38,7 +39,18 @@ pub unsafe fn open_rc(
         )
     };
     let (qp, qpn, sized) = api
-        .qp(pd, send, receive, max_send_wr, max_recv_wr)
+        .qp(
+            pd,
+            send,
+            receive,
+            sys::Creation {
+                send_depth: max_send_wr,
+                receive_depth: max_recv_wr,
+                max_sge: 1,
+                srq: None,
+                kind: sys::ffi::IBV_QPT_RC,
+            },
+        )
         .map_err(provider_errno)?;
     h.qp = qp.raw();
     if !sized {

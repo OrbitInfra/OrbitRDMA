@@ -89,6 +89,33 @@ static union ibv_gid port_gid(uint32_t port) {
     gid.raw[15] = (uint8_t)port;
     return gid;
 }
+struct ibv_srq *ibv_create_srq(struct ibv_pd *pd, struct ibv_srq_init_attr *attr) {
+    if (event("create_srq") || !attr->attr.max_wr || attr->attr.max_sge != 1) return NULL;
+    struct ibv_srq *s=calloc(1,sizeof(*s));
+    if (s) { s->pd=pd; s->context=pd->context; }
+    return s;
+}
+int ibv_destroy_srq(struct ibv_srq *srq) {
+    if (event("destroy_srq")) return EIO;
+    for (struct test_qp *q=all_qps;q;q=q->next_qp) if(q->qp.srq==srq)return EBUSY;
+    free(srq); return 0;
+}
+static int shared_recv(struct ibv_srq *s,struct ibv_recv_wr *wr,struct ibv_recv_wr **bad){
+    struct test_qp q={.qp={.pd=s->pd}};
+    if(event("post_srq") || wr->num_sge!=1 || !valid_sge(&q,wr->sg_list)) { *bad=wr; return EINVAL; }
+    if(is("uncertain_srq")) { *bad=NULL; return EIO; }
+    return 0;
+}
+struct ibv_ah *ibv_create_ah(struct ibv_pd *pd,struct ibv_ah_attr *attr){
+    if(event("create_ah") || !attr->port_num) return NULL;
+    if (attr->port_num == 2 && attr->is_global &&
+        (attr->grh.dgid.raw[15] != 2 || attr->grh.sgid_index != 1 || !attr->grh.hop_limit)) return NULL;
+    event(attr->is_global ? "ah_global" : "ah_local");
+    struct ibv_ah *ah=calloc(1,sizeof(*ah));
+    if(ah) { ah->pd=pd; ah->context=pd->context; }
+    return ah;
+}
+int ibv_destroy_ah(struct ibv_ah *ah) { if(event("destroy_ah")) return EIO; free(ah); return 0; }
 static struct ibv_mw *alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type) {
     if (event("alloc_mw") || type != IBV_MW_TYPE_2)
         return NULL;
@@ -143,8 +170,8 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
         if (wr->bind_mw.mw->pd != base->pd || mr->pd != base->pd || info->addr < start ||
             info->length == 0 || info->length > mr->length ||
             info->addr - start > mr->length - info->length ||
-            !(info->mw_access_flags & (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)) ||
-            (info->mw_access_flags & ~(IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)))
+            !info->mw_access_flags ||
+            (info->mw_access_flags & ~(IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC)))
             return EINVAL;
         w = (struct test_mw *)wr->bind_mw.mw;
         w->valid = 1;
@@ -174,16 +201,10 @@ static int post(struct ibv_qp *base, struct ibv_send_wr *wr, struct ibv_send_wr 
     } /* ambiguous submission */
     return 0;
 }
-static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
-    struct test_cq *cq = (struct test_cq *)base;
-    if (event("poll"))
-        return -EIO;
-    if (n != 1)
-        return -EINVAL;
-    if (!cq->count || is("delay")) return 0;
+static void take_wc(struct test_cq *cq, struct ibv_wc *wc) {
     *wc = cq->data[cq->head++ % 256];
     --cq->count;
-    if (wc->opcode != IBV_WC_BIND_MW && wc->opcode != IBV_WC_LOCAL_INV) return 1;
+    if (wc->opcode != IBV_WC_BIND_MW && wc->opcode != IBV_WC_LOCAL_INV) return;
     for (struct test_mw *w = all_mws; w; w = w->next)
         if (w->qp && w->qp->qp.qp_num == wc->qp_num && w->control_id == wc->wr_id)
             w->control_pending = 0;
@@ -195,7 +216,20 @@ static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
         wc->opcode = IBV_WC_SEND;
     if (is("failed_wc"))
         wc->status = IBV_WC_WR_FLUSH_ERR;
-    return 1;
+}
+static int poll(struct ibv_cq *base, int n, struct ibv_wc *wc) {
+    struct test_cq *cq = (struct test_cq *)base;
+    if (event("poll"))
+        return -EIO;
+    if (n <= 0) return -EINVAL;
+    if (is("overreported_poll")) return n + 1;
+    if (is("delay")) return 0;
+    int count = 0;
+    while (count < n && cq->count) {
+        take_wc(cq, wc + count);
+        ++count;
+    }
+    return count;
 }
 static void fill_port(uint8_t p, struct ibv_port_attr *a) {
     a->gid_tbl_len = 2;
@@ -236,6 +270,7 @@ struct ibv_context *ibv_open_device(struct ibv_device *d) {
     c->ops.post_recv = data_recv;
     c->ops.req_notify_cq = data_arm;
     c->ops.poll_cq = poll;
+    c->ops.post_srq_recv = shared_recv;
     return c;
 }
 int ibv_close_device(struct ibv_context *c) {
@@ -257,6 +292,10 @@ int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) {
         return EIO;
     a->phys_port_cnt = 2;
     a->max_qp_wr = 128;
+    a->max_sge = 8;
+    a->max_sge_rd = 1;
+    a->max_srq_wr = 160;
+    a->atomic_cap = is("no_atomics") ? IBV_ATOMIC_NONE : IBV_ATOMIC_HCA;
     a->max_cqe = 192;
     a->max_qp_rd_atom = 3;
     a->max_qp_init_rd_atom = 5;
@@ -390,8 +429,8 @@ int ibv_dereg_mr(struct ibv_mr *m) {
     return 0;
 }
 struct ibv_qp *ibv_create_qp(struct ibv_pd *p, struct ibv_qp_init_attr *a) {
-    if (event("qp") || a->qp_type != IBV_QPT_RC || (is("shared_cqs") ? a->send_cq == a->recv_cq : a->send_cq != a->recv_cq) ||
-        a->send_cq->context != p->context || a->recv_cq->context != p->context || a->cap.max_send_sge != 1 || a->cap.max_recv_sge != 1 ||
+    if (event("qp") || (a->qp_type != IBV_QPT_RC && a->qp_type != IBV_QPT_UD) || (is("shared_cqs") ? a->send_cq == a->recv_cq : a->send_cq != a->recv_cq) ||
+        a->send_cq->context != p->context || a->recv_cq->context != p->context || a->cap.max_send_sge < 1 || a->cap.max_send_sge > 8 || a->cap.max_recv_sge != a->cap.max_send_sge ||
         a->sq_sig_all != 0)
         return NULL;
     struct test_qp *q = calloc(1, sizeof(*q));
@@ -399,6 +438,8 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *p, struct ibv_qp_init_attr *a) {
         return NULL;
     q->qp.context = p->context;
     q->qp.pd = p;
+    q->qp.qp_type = a->qp_type;
+    q->qp.srq = a->srq;
     q->qp.send_cq = a->send_cq;
     q->qp.recv_cq = a->recv_cq;
     q->qp.qp_num = is("reuse_qpn") ? 0x1240 : ++qpn;
@@ -437,6 +478,12 @@ unsigned orbit_attr(int n) {
 }
 int ibv_modify_qp(struct ibv_qp *base, struct ibv_qp_attr *a, int mask) {
     struct test_qp *q = (struct test_qp *)base;
+    if (base->qp_type == IBV_QPT_UD) {
+        unsigned masks[] = {IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_QKEY, IBV_QP_STATE, IBV_QP_STATE|IBV_QP_SQ_PSN};
+        enum ibv_qp_state states[] = {IBV_QPS_INIT, IBV_QPS_RTR, IBV_QPS_RTS};
+        if (q->stage >= 3 || mask != (int)masks[q->stage] || a->qp_state != states[q->stage]) return EINVAL;
+        ++q->stage; return 0;
+    }
     switch (a->qp_state) {
     case IBV_QPS_RESET:
         if (event("reset")) return EIO;
@@ -452,7 +499,7 @@ int ibv_modify_qp(struct ibv_qp *base, struct ibv_qp_attr *a, int mask) {
             return EIO;
         if (q->stage ||
             mask != (IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) ||
-            a->qp_access_flags != (is("shared_cqs") ? IBV_ACCESS_REMOTE_READ : (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)) ||
+            (a->qp_access_flags & ~IBV_ACCESS_REMOTE_ATOMIC) != (is("shared_cqs") ? IBV_ACCESS_REMOTE_READ : (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE)) ||
             !a->port_num || a->pkey_index)
             return EINVAL;
         break;

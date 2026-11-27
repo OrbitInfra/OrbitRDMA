@@ -29,13 +29,18 @@ fn main() {
     } else {
         "#include <infiniband/verbs.h>"
     };
+    let headers = if env::var_os("CARGO_FEATURE_CM").is_some() {
+        format!("{headers}\n#include <rdma/rdma_cma.h>")
+    } else {
+        headers.to_owned()
+    };
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     bindgen::Builder::default()
-        .header_contents("orbit-rdma-abi.h", headers)
+        .header_contents("orbit-rdma-abi.h", &headers)
         .allowlist_type(
-            "ibv_.*|_compat_ibv_port_attr|verbs_context|mlx5dv_obj|mlx5dv_pd|mlx5dv_obj_type",
+            "ibv_.*|_compat_ibv_port_attr|verbs_context|rdma_cm_id|rdma_addrinfo|rdma_conn_param|rdma_port_space|mlx5dv_obj|mlx5dv_pd|mlx5dv_obj_type",
         )
-        .allowlist_var("IBV_.*|MLX5DV_OBJ_PD")
+        .allowlist_var("IBV_.*|RAI_.*|MLX5DV_OBJ_PD")
         .prepend_enum_name(false)
         .derive_default(true)
         .layout_tests(false)

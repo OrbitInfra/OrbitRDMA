@@ -18,22 +18,13 @@ struct Backing {
 }
 
 impl Backing {
-    fn allocate(
-        &mut self,
-        domain: &Domain,
-        permissions: Permissions,
-    ) -> Result<(u32, sys::WindowBind)> {
+    fn allocate(&mut self, domain: &Domain, access: u32) -> Result<(u32, sys::WindowBind)> {
         let (_, _, pd) = domain.native()?;
         let mr = self.loan.register_window(self.api, pd)?;
         self.mr = Some(mr);
         let (mw, seed) = self.api.window(pd)?;
         self.mw = Some(mw);
-        let access = match permissions {
-            Permissions::RemoteRead => sys::ffi::IBV_ACCESS_REMOTE_READ,
-            Permissions::RemoteWrite => sys::ffi::IBV_ACCESS_REMOTE_WRITE,
-            Permissions::RemoteReadWrite => sys::RC_READ_WRITE,
-            Permissions::Local => return Err(Error::PermissionDenied),
-        };
+
         Ok((
             domain.burn_key(seed)?,
             sys::WindowBind {
@@ -153,6 +144,39 @@ impl QueuePair {
         range: Range<usize>,
         permissions: Permissions,
     ) -> Result<SharedWindow> {
+        let access = match permissions {
+            Permissions::RemoteRead => sys::ffi::IBV_ACCESS_REMOTE_READ,
+            Permissions::RemoteWrite => sys::ffi::IBV_ACCESS_REMOTE_WRITE,
+            Permissions::RemoteReadWrite => sys::RC_READ_WRITE,
+            Permissions::Local => return Err(Error::PermissionDenied),
+        };
+        self.bind_range(memory, range, permissions, access)
+    }
+    /// Bind an atomic-only key. Granting read/modify/write requires a region
+    /// registered with both remote read and write permission.
+    pub fn expose_atomic_window(
+        &mut self,
+        memory: &RegisteredMemory,
+        range: Range<usize>,
+    ) -> Result<AtomicWindow> {
+        if !self.connected()?.atomics {
+            return Err(Error::Unsupported("RC atomic operations"));
+        }
+        let window = self.bind_range(
+            memory,
+            range,
+            Permissions::RemoteReadWrite,
+            sys::ffi::IBV_ACCESS_REMOTE_ATOMIC,
+        )?;
+        Ok(AtomicWindow(window))
+    }
+    fn bind_range(
+        &mut self,
+        memory: &RegisteredMemory,
+        range: Range<usize>,
+        permissions: Permissions,
+        access: u32,
+    ) -> Result<SharedWindow> {
         self.connected()?;
         let qpn = self.parameters().qpn;
         let q = self.owner.get_mut()?;
@@ -166,6 +190,11 @@ impl QueuePair {
         let mut control = SharedWindowControl::default();
         control.bind(qpn, id)?;
         let loan = memory.window_loan(&q.domain, range, permissions)?;
+        if access == sys::ffi::IBV_ACCESS_REMOTE_ATOMIC
+            && (loan.address() % 8 != 0 || loan.length % 8 != 0)
+        {
+            return Err(Error::Invalid("atomic window alignment or width"));
+        }
         let mut backing = Owner::new(Backing {
             api: q.api,
             mr: None,
@@ -176,7 +205,7 @@ impl QueuePair {
         });
         let (key, bind) = backing
             .get_mut()?
-            .allocate(&q.domain, permissions)
+            .allocate(&q.domain, access)
             .map_err(|e| backing.rollback(e))?;
         let receipt = sys::post_window(qp, id, key, Some(bind)).map_err(|e| backing.rollback(e))?;
         let error = Error::Native {
@@ -310,5 +339,32 @@ impl SharedWindow {
                 Ok(true)
             }
         }
+    }
+}
+
+/// An atomic-only type-2 window on the original RC QP.
+pub struct AtomicWindow(SharedWindow);
+/// Descriptor for a remote atomic-only window, exchanged by the application's control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicTarget {
+    pub qpn: u32,
+    pub address: u64,
+    pub length: u64,
+    pub rkey: u32,
+}
+impl AtomicWindow {
+    pub fn descriptor(&self, qp: &mut QueuePair) -> Result<Option<AtomicTarget>> {
+        Ok(self
+            .0
+            .descriptor(qp, RemoteAccess::Write)?
+            .map(|d| AtomicTarget {
+                qpn: d.qpn,
+                address: d.address,
+                length: d.length,
+                rkey: d.rkey,
+            }))
+    }
+    pub fn revoke(&mut self, qp: &mut QueuePair) -> Result<bool> {
+        self.0.revoke(qp)
     }
 }

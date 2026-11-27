@@ -23,6 +23,14 @@ pub(crate) struct RcPath {
     pub hop_limit: u8,
 }
 
+pub(crate) struct Creation {
+    pub send_depth: u32,
+    pub receive_depth: u32,
+    pub max_sge: u32,
+    pub srq: Option<shared::Srq>,
+    pub kind: u32,
+}
+
 impl Native {
     pub(crate) fn channel(&self, ctx: Context) -> RdmaResult<Channel> {
         handle(
@@ -58,18 +66,25 @@ impl Native {
         pd: Pd,
         send: Cq,
         receive: Cq,
-        send_depth: u32,
-        receive_depth: u32,
+        config: Creation,
     ) -> RdmaResult<(Qp, u32, bool)> {
+        let Creation {
+            send_depth,
+            receive_depth,
+            max_sge,
+            srq,
+            kind,
+        } = config;
         let mut init = ffi::ibv_qp_init_attr {
             send_cq: send.0.as_ptr(),
             recv_cq: receive.0.as_ptr(),
-            qp_type: ffi::IBV_QPT_RC,
+            qp_type: kind,
+            srq: srq.map_or(std::ptr::null_mut(), |s| s.0.as_ptr()),
             cap: ffi::ibv_qp_cap {
                 max_send_wr: send_depth,
                 max_recv_wr: receive_depth,
-                max_send_sge: 1,
-                max_recv_sge: 1,
+                max_send_sge: max_sge,
+                max_recv_sge: max_sge,
                 ..Default::default()
             },
             ..Default::default()
@@ -85,9 +100,9 @@ impl Native {
             qp,
             qpn,
             init.cap.max_send_wr >= send_depth
-                && init.cap.max_recv_wr >= receive_depth
-                && init.cap.max_send_sge >= 1
-                && init.cap.max_recv_sge >= 1,
+                && (srq.is_some() || init.cap.max_recv_wr >= receive_depth)
+                && init.cap.max_send_sge >= max_sge
+                && (srq.is_some() || init.cap.max_recv_sge >= max_sge),
         ))
     }
     fn modify_raw(&self, qp: Qp, mut attr: ffi::ibv_qp_attr, mask: u32) -> c_int {
@@ -102,6 +117,22 @@ impl Native {
         op: &'static str,
     ) -> RdmaResult<()> {
         check(op, self.modify_raw(qp, attr, mask))
+    }
+    #[cfg(feature = "cm")]
+    pub(crate) fn error_state(&self, qp: Qp) -> std::result::Result<(), Fault> {
+        let rc = self.modify_raw(
+            qp,
+            ffi::ibv_qp_attr {
+                qp_state: ffi::IBV_QPS_ERR,
+                ..Default::default()
+            },
+            ffi::IBV_QP_STATE,
+        );
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Fault("ibv_modify_qp ERR", rc))
+        }
     }
     pub(crate) fn reset(&self, qp: Qp) -> std::result::Result<(), Fault> {
         let attr = ffi::ibv_qp_attr {
@@ -128,6 +159,38 @@ impl Native {
                 | ffi::IBV_QP_PORT
                 | ffi::IBV_QP_ACCESS_FLAGS,
             "ibv_modify_qp INIT",
+        )
+    }
+    pub(crate) fn start_ud(&self, qp: Qp, port: u8, qkey: u32, psn: u32) -> RdmaResult<()> {
+        self.modify(
+            qp,
+            ffi::ibv_qp_attr {
+                qp_state: ffi::IBV_QPS_INIT,
+                port_num: port,
+                qkey,
+                ..Default::default()
+            },
+            ffi::IBV_QP_STATE | ffi::IBV_QP_PKEY_INDEX | ffi::IBV_QP_PORT | ffi::IBV_QP_QKEY,
+            "ibv_modify_qp UD INIT",
+        )?;
+        self.modify(
+            qp,
+            ffi::ibv_qp_attr {
+                qp_state: ffi::IBV_QPS_RTR,
+                ..Default::default()
+            },
+            ffi::IBV_QP_STATE,
+            "ibv_modify_qp UD RTR",
+        )?;
+        self.modify(
+            qp,
+            ffi::ibv_qp_attr {
+                qp_state: ffi::IBV_QPS_RTS,
+                sq_psn: psn,
+                ..Default::default()
+            },
+            ffi::IBV_QP_STATE | ffi::IBV_QP_SQ_PSN,
+            "ibv_modify_qp UD RTS",
         )
     }
     pub(crate) fn connect(&self, qp: Qp, path: RcPath) -> RdmaResult<()> {

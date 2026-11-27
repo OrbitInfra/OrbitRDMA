@@ -1,4 +1,5 @@
 //! Each RC QP owns one private CQ and completion channel.
+pub(crate) mod group;
 use crate::device::{Charge, Domain, Permit};
 use crate::resource::{Cleanup, Fault, Owner, Result};
 use crate::{Device, Error, Link, sys};
@@ -57,8 +58,15 @@ pub(crate) struct QueueData {
     pub api: &'static sys::Native,
     pub qp: Option<sys::Qp>,
     pub cq: Option<sys::Cq>,
+    pub shared_cq: Option<Arc<group::CqOwner>>,
     pub channel: Option<sys::Channel>,
     pub payload: crate::operation::PayloadQueue,
+    pub route: Option<sys::shared::DatagramRoute>,
+    pub srq: Option<crate::SharedReceiveQueue>,
+    // RTR may receive SRQ work even if the following RTS transition fails.
+    srq_exposed: bool,
+    pub max_sge: u32,
+    pub atomics: bool,
     pub windows: crate::window::Windows,
     #[cfg(feature = "tokio")]
     pub notifier: Option<crate::operation::notification::Notifier>,
@@ -82,13 +90,27 @@ impl Cleanup for QueueData {
     fn cleanup(&mut self) -> std::result::Result<(), Fault> {
         #[cfg(feature = "tokio")]
         self.notifier.take();
-        if let Err(fault) = self.destroy_qp() {
+        let srq = self.srq.clone().filter(|_| self.srq_exposed);
+        let destroyed = match srq {
+            Some(pool) => pool
+                .detach(false, || self.destroy_qp())
+                .map_err(|_| Fault("detach shared receive queue", libc::EIO))?,
+            None => self.destroy_qp(),
+        };
+        if let Err(fault) = destroyed {
             self.payload.quarantine(fault);
             return Err(fault);
         }
         self.payload.drained();
+        if let Some(route) = &mut self.route {
+            route.close()?;
+        }
         let windows = self.windows.drain();
-        sys::destroy(&mut self.cq, "ibv_destroy_cq", self.api.ibv_destroy_cq)?;
+        if self.shared_cq.is_some() {
+            self.cq.take();
+        } else {
+            sys::destroy(&mut self.cq, "ibv_destroy_cq", self.api.ibv_destroy_cq)?;
+        }
         sys::destroy(
             &mut self.channel,
             "ibv_destroy_comp_channel",
@@ -107,11 +129,45 @@ pub struct QueuePair {
 impl Device {
     /// Creates an RC queue pair in INIT. Its PSN comes from the caller's connection policy.
     pub fn queue_pair(&self, config: QueueConfig) -> Result<QueuePair> {
+        self.queue_pair_with_sge(config, 1)
+    }
+    /// Request a per-WR scatter/gather capacity for both send and receive queues.
+    pub fn queue_pair_with_sge(&self, config: QueueConfig, max_sge: u32) -> Result<QueuePair> {
+        self.create_qp(config, max_sge, false, None, None, None)
+    }
+    /// Opt in to standard 64-bit remote atomics on an atomic-capable device.
+    pub fn atomic_queue_pair(&self, config: QueueConfig, max_sge: u32) -> Result<QueuePair> {
+        self.create_qp(config, max_sge, true, None, None, None)
+    }
+    pub fn queue_pair_with_srq(
+        &self,
+        config: QueueConfig,
+        max_sge: u32,
+        srq: &crate::SharedReceiveQueue,
+    ) -> Result<QueuePair> {
+        self.create_qp(config, max_sge, false, Some(srq.clone()), None, None)
+    }
+    pub(crate) fn create_qp(
+        &self,
+        config: QueueConfig,
+        max_sge: u32,
+        atomics: bool,
+        srq: Option<crate::SharedReceiveQueue>,
+        ud_key: Option<u32>,
+        shared_cq: Option<Arc<group::CqOwner>>,
+    ) -> Result<QueuePair> {
         let domain = self.domain()?;
+        let shared = srq.as_ref().map(|s| s.native(domain)).transpose()?;
         let caps = domain.caps;
+        if atomics && (!caps.atomics || config.read_depth == 0) {
+            return Err(Error::Unsupported("RC atomic operations"));
+        }
+        if max_sge == 0 || max_sge > caps.max_sge {
+            return Err(Error::Unsupported("requested QP scatter/gather limit"));
+        }
         let depth = config
             .send_depth
-            .checked_add(config.receive_depth)
+            .checked_add(shared.map_or(config.receive_depth, |(_, depth)| depth))
             .filter(|&v| v <= caps.max_cqe)
             .ok_or(Error::Invalid("completion queue depth"))?;
         if config.psn > 0xff_ffff
@@ -127,13 +183,21 @@ impl Device {
         if api.port(ctx, port.number, port.gid_index)? != port {
             return Err(Error::Invalid("selected route changed"));
         }
+        let mut payload = crate::operation::PayloadQueue::new(config);
+        payload.datagram = ud_key.is_some();
         let mut owner = Owner::new(QueueData {
             domain: domain.clone(),
             api,
             qp: None,
             cq: None,
             channel: None,
-            payload: crate::operation::PayloadQueue::new(config),
+            shared_cq,
+            payload,
+            srq,
+            srq_exposed: false,
+            route: None,
+            max_sge,
+            atomics,
             windows: Default::default(),
             #[cfg(feature = "tokio")]
             notifier: None,
@@ -141,14 +205,36 @@ impl Device {
         });
         let create = (|| {
             let r = owner.get_mut()?;
-            let channel = api.channel(ctx)?;
-            r.channel = Some(channel);
-            let (cq, enough_entries) = api.cq(ctx, Some(channel), depth as i32)?;
-            r.cq = Some(cq);
-            if !enough_entries {
-                return Err(Error::Unsupported("requested CQ depth"));
-            }
-            let (qp, qpn, sized) = api.qp(pd, cq, cq, config.send_depth, config.receive_depth)?;
+            let cq = if let Some(shared) = &r.shared_cq {
+                let cq = shared.handle()?;
+                r.cq = Some(cq);
+                cq
+            } else {
+                let channel = api.channel(ctx)?;
+                r.channel = Some(channel);
+                let (cq, enough_entries) = api.cq(ctx, Some(channel), depth as i32)?;
+                r.cq = Some(cq);
+                if !enough_entries {
+                    return Err(Error::Unsupported("requested CQ depth"));
+                }
+                cq
+            };
+            let (qp, qpn, sized) = api.qp(
+                pd,
+                cq,
+                cq,
+                sys::Creation {
+                    send_depth: config.send_depth,
+                    receive_depth: config.receive_depth,
+                    max_sge,
+                    srq: shared.map(|(handle, _)| handle),
+                    kind: if ud_key.is_some() {
+                        sys::ffi::IBV_QPT_UD
+                    } else {
+                        sys::ffi::IBV_QPT_RC
+                    },
+                },
+            )?;
             r.qp = Some(qp);
             if !sized {
                 return Err(Error::Unsupported("requested QP depth"));
@@ -164,7 +250,17 @@ impl Device {
                 responder_depth: config.read_depth.min(caps.responder),
             };
             local.validate(port.link)?;
-            api.init(qp, port.number, sys::RC_READ_WRITE)?;
+            let access = sys::RC_READ_WRITE
+                | if atomics {
+                    sys::ffi::IBV_ACCESS_REMOTE_ATOMIC
+                } else {
+                    0
+                };
+            if let Some(qkey) = ud_key {
+                api.start_ud(qp, port.number, qkey, config.psn)?;
+            } else {
+                api.init(qp, port.number, access)?;
+            }
             Ok(local)
         })();
         let local = create.map_err(|e| owner.rollback(e))?;
@@ -195,7 +291,7 @@ impl QueuePair {
     /// ```
     pub fn connect(&mut self, peer: &ConnectionParams) -> Result<()> {
         self.unconnected()?;
-        let data = self.owner.get()?;
+        let data = self.owner.get_mut()?;
         peer.validate(self.local.link)?;
         let port = data.domain.port;
         let (_, ctx, _) = data.domain.native()?;
@@ -203,6 +299,7 @@ impl QueuePair {
             return Err(Error::Invalid("selected route changed"));
         }
         let qp = data.qp.ok_or(Error::Closed)?;
+        data.srq_exposed = data.srq.is_some();
         if let Err(e) = data.api.connect(
             qp,
             sys::RcPath {
@@ -248,7 +345,24 @@ impl QueuePair {
     /// windows it resets the QP and detaches their keys before destroying the QP.
     /// The backing stays held through QP destruction and MR deregistration.
     /// A failed native teardown step is terminal.
+    /// An SRQ-attached RC QP returns Busy while a healthy pool has outstanding
+    /// receives. Drive their receiving QPs and retry. Dropping a connected QP
+    /// instead fences such a pool; its SRQ retains outstanding DMA loans until
+    /// their own CQEs or successful SRQ destruction.
     pub fn close(&mut self) -> Result<()> {
+        if let Some(pool) = self
+            .owner
+            .get()
+            .ok()
+            .filter(|q| q.srq_exposed)
+            .and_then(|q| q.srq.clone())
+        {
+            return pool.detach(true, || {
+                // Posting to this SRQ stays locked through native QP destruction.
+                self.owner.get_mut()?.srq_exposed = false;
+                self.owner.release().map(drop)
+            })?;
+        }
         self.owner.release().map(drop)
     }
 }

@@ -11,15 +11,18 @@ use libloading::Library;
 
 use crate::LoadError;
 
+#[cfg(feature = "cm")]
+pub(crate) mod cm;
 mod device;
 mod memory;
 pub(crate) mod port;
 mod queue;
+pub(crate) mod shared;
 pub(crate) mod transfer;
 pub(crate) use device::{Caps, Context, Pd};
 pub(crate) use memory::{Bind, Mr, Mw};
 pub(crate) use memory::{WindowBind, post_window};
-pub(crate) use queue::{Channel, Cq, Qp, RcPath};
+pub(crate) use queue::{Channel, Cq, Creation, Qp, RcPath};
 pub(crate) const RC_READ_WRITE: u32 = ffi::IBV_ACCESS_REMOTE_READ | ffi::IBV_ACCESS_REMOTE_WRITE;
 pub(crate) use transfer::{DataOpcode, WorkCompletion, local_key, storage};
 

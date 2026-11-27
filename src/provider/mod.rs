@@ -4,7 +4,11 @@
 #![allow(unsafe_code)]
 use std::ffi::{CStr, c_char, c_int, c_void};
 pub mod abi;
+mod accounting;
 use abi as ffi;
+pub use accounting::{NamedKeyCursor, WorkNamespaces};
+mod credits;
+pub use credits::{PostedWindow, ReceiveSlot, SendQueueLedger, WorkSlice};
 mod cq;
 mod device;
 pub mod inventory;
@@ -237,6 +241,15 @@ destroy!(close_device, DeviceHandles, context, ibv_close_device);
 pub struct PostResult {
     pub accepted: usize,
     pub uncertain: bool,
+}
+impl PostResult {
+    /// Recover the exact or unknown accepted prefix from a provider table result.
+    pub fn receipt(&self, code: i32) -> crate::verbs::PostReceipt {
+        crate::verbs::PostReceipt {
+            accepted: (!self.uncertain).then_some(self.accepted),
+            code,
+        }
+    }
 }
 
 pub fn provider_errno(error: crate::Error) -> c_int {

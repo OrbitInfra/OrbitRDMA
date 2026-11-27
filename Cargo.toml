@@ -1,6 +1,6 @@
 [package]
 name = "orbit-rdma"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Linux RC RDMA transfers with registered host buffers and explicit completion receipts"
@@ -22,6 +22,7 @@ required-features = ["tokio"]
 
 [features]
 default = []
+cm = []
 provider = []
 mlx5 = ["provider"]
 tokio = ["dep:tokio"]
@@ -44,3 +45,12 @@ unsafe_code = "deny"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[[example]]
+name = "advanced_peer"
+path = "tests/package/advanced_peer.rs"
+
+[[example]]
+name = "cm_peer"
+path = "tests/package/cm_peer.rs"
+required-features = ["cm"]
