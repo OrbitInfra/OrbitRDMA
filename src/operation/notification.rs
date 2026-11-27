@@ -7,6 +7,8 @@ use std::os::fd::OwnedFd;
 use tokio::io::{Interest, unix::AsyncFd};
 use tokio::runtime::{Handle, Id};
 
+const CHANNEL_READY: Interest = Interest::READABLE.add(Interest::ERROR);
+
 pub(crate) struct Notifier {
     runtime: Id,
     channel: AsyncFd<OwnedFd>,
@@ -40,13 +42,26 @@ impl QueueData {
                 slot => {
                     let fd = sys::Native::notification_fd(ch)?;
                     let channel =
-                        AsyncFd::with_interest(fd, Interest::READABLE).map_err(reactor_error)?;
+                        AsyncFd::with_interest(fd, CHANNEL_READY).map_err(reactor_error)?;
                     slot.insert(Notifier { runtime, channel })
                 }
             };
-            let mut ready = notifier.channel.readable().await.map_err(reactor_error)?;
+            let mut ready = notifier
+                .channel
+                .ready(CHANNEL_READY)
+                .await
+                .map_err(reactor_error)?;
             match self.api.consume_event(ch, cq) {
                 Ok(true) => self.payload.armed = false,
+                // A disassociated uverbs channel can report only EPOLLERR. Some
+                // kernels return EAGAIN on the final nonblocking event read.
+                Ok(false) if ready.ready().is_error() || ready.ready().is_read_closed() => {
+                    self.payload.fenced = true;
+                    return Err(Error::Native {
+                        operation: "completion channel closed",
+                        code: libc::EIO,
+                    });
+                }
                 Ok(false) => ready.clear_ready(),
                 Err(err) => {
                     self.payload.fenced = true;

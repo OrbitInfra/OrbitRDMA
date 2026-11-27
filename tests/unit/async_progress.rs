@@ -191,6 +191,50 @@ fn async_event_races_errors_and_blocking_handoff() {
 }
 
 #[test]
+fn error_only_channel_wakes_and_keeps_dma_until_destroy() {
+    isolated(
+        "async_progress::error_only_channel_wakes_and_keeps_dma_until_destroy",
+        |p| {
+            let d = device();
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            for mode in ["event_error_only", "event_error_again"] {
+                p.option(mode);
+                let mut q = conn(&d);
+                let op = receive(&mut q, &m);
+                if mode == "event_error_only" {
+                    p.fault("get_event", "");
+                }
+                let error = runtime().block_on(async {
+                    timeout(Duration::from_secs(2), op.wait_async(&mut q))
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                });
+                assert!(matches!(
+                    error,
+                    Error::Native {
+                        code: libc::EIO,
+                        ..
+                    }
+                ));
+                assert!(matches!(m.write(0..4), Err(Error::Busy)));
+                assert!(
+                    q.submit(vec![Request::new(
+                        m.range(4..8).unwrap(),
+                        Transfer::Receive
+                    )])
+                    .is_err()
+                );
+                assert!(!op.is_reusable());
+                p.fault("", "");
+                q.close().unwrap();
+                assert!(op.is_reusable());
+            }
+        },
+    );
+}
+
+#[test]
 fn interrupted_handshake_uses_a_fresh_stream_and_validates_the_peer() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     isolated(
