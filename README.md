@@ -42,7 +42,7 @@ fn connect_peer(
 
 ## Keep a connection open across windows
 
-On the development branch, `QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
+In this checkout, `QueuePair::expose_window` borrows a connected QP and grants access to one range of registered **host** memory. Two disjoint windows can be open while the QP also sends or receives data. The provider must support RC and type-2B memory windows.
 
 ```rust
 let mut a = qp.expose_window(&region, 0..4096, Permissions::RemoteWrite)?;
@@ -105,7 +105,7 @@ handle RC, CQ, MR and MW operations through the installed driver. For RoCE, sele
 a matching Ethernet GID type at both ends. For InfiniBand, the subnet manager
 configures the fabric and assigns LIDs. The peers exchange QP and path parameters
 over their control channel, then use the same Rust transfer API.
-[rdma-core providers](https://github.com/linux-rdma/rdma-core#supported-kernel-abis) · [InfiniBand subnet management](https://networking-docs.nvidia.com/nvidiainfinibandsecurityoverviewandguidelines/security-in-infiniband)
+[rdma-core providers](https://github.com/linux-rdma/rdma-core/tree/master/providers) · [InfiniBand subnet management](https://networking-docs.nvidia.com/nvidiainfinibandsecurityoverviewandguidelines/security-in-infiniband)
 
 OrbiTE's direct CUDA route exports a GPU allocation as dma-buf or selects a
 supported peer-memory driver. It owns CUDA ordering, GPU memory lifetime and
@@ -126,7 +126,7 @@ target/release/examples/host_peer connect 192.0.2.1:7400 mlx5_0 1 0
 
 Both processes use one RC QP apiece. The requester writes A and B, waits for the owner to revoke and reuse A, then reads B, overwrites it and reads it back. The same QP carries a final SEND/RECV. Both peers verify guard bytes. TCP carries connection parameters, window descriptors and acknowledgements. [Two-peer consumer](tests/package/host_peer.rs)
 
-For a single-host Soft-RoCE run, create an RXE device on the Linux host and select its active GID index. Give the Docker container the host network namespace, its `/dev/infiniband/uverbsN` device and sufficient locked memory. Inside the container, run the following for each installed toolchain. The runner starts two separate processes per repetition. Physical two-host RNIC and GPU profiles require their own installed runs. [Linux RXE setup](https://github.com/linux-rdma/rdma-core#software-rdma-drivers) · [Verification plan](docs/development-plan.md#release-decision)
+For a single-host Soft-RoCE run, create an RXE device on the Linux host and select its active GID index. Give the Docker container the host network namespace, its `/dev/infiniband/uverbsN` device and sufficient locked memory. Inside the container, run the following for each installed toolchain. The runner starts two separate processes per repetition. Physical two-host RNIC and GPU profiles require their own installed runs. [Linux RXE setup](https://github.com/linux-rdma/rdma-core#usage) · [Verification plan](docs/development-plan.md#release-decision)
 
 ```sh
 for tc in stable 1.85.0; do
