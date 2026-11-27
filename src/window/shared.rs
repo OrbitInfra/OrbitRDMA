@@ -1,4 +1,5 @@
 //! Independent type-2B windows on a long-lived RC queue pair.
+use super::control::{SharedWindowControl, Stage};
 use super::{RemoteAccess, RemoteDescriptor};
 use crate::device::{Charge, Domain, Permit};
 use crate::memory::Loan;
@@ -56,16 +57,8 @@ impl Cleanup for Backing {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    Binding,
-    Ready,
-    Invalidating,
-    Invalidated,
-}
-
 struct Window {
-    stage: Stage,
+    control: SharedWindowControl,
     backing: Owner<Backing>,
 }
 
@@ -86,44 +79,37 @@ impl Windows {
         if self.entries.is_empty() {
             return Ok(false);
         }
-        let (id, which) = match wc {
-            sys::WorkCompletion::Success { id, qpn, .. }
-            | sys::WorkCompletion::Error { id, qpn, .. } => (id, qpn),
+        let (id, which, status, opcode) = match wc {
+            sys::WorkCompletion::Success {
+                id, qpn, opcode, ..
+            } => (id, qpn, 0, opcode),
+            sys::WorkCompletion::Error {
+                id, qpn, status, ..
+            } => (id, qpn, status, 0),
         };
-        // Each window reserves adjacent, process-unique bind and invalidate IDs.
-        let (w, stage, opcode, next) = if let Some(w) = self.entries.get_mut(&id) {
-            (w, Stage::Binding, sys::ffi::IBV_WC_BIND_MW, Stage::Ready)
-        } else if let Some(w) = id.checked_sub(1).and_then(|key| self.entries.get_mut(&key)) {
-            (
-                w,
-                Stage::Invalidating,
-                sys::ffi::IBV_WC_LOCAL_INV,
-                Stage::Invalidated,
-            )
+        // Adjacent, process-unique IDs let payloads and multiple grants share this CQ.
+        let key = if self.entries.contains_key(&id) {
+            id
+        } else if let Some(key) = id.checked_sub(1) {
+            key
         } else {
             return Ok(false);
         };
-        if which != qpn || w.stage != stage {
-            return Err(Error::Invalid("foreign or stale window completion"));
+        let Some(window) = self.entries.get_mut(&key) else {
+            return Ok(false);
+        };
+        if which != qpn {
+            return Err(Error::Invalid("foreign window completion QP"));
         }
-        match wc {
-            sys::WorkCompletion::Error { status, .. } => Err(Error::Native {
-                operation: "window completion",
-                code: status as i32,
-            }),
-            sys::WorkCompletion::Success { opcode: actual, .. } if actual == opcode => {
-                w.stage = next;
-                self.pending -= 1;
-                Ok(true)
-            }
-            _ => Err(Error::Invalid("window completion opcode")),
-        }
+        window.control.complete(which, id, status, opcode)?;
+        self.pending -= 1;
+        Ok(true)
     }
     /// Called only after QP RESET has removed all pending bind/invalidate WRs.
     /// Detaching a key retains its MR, range loan and reservations until QP destroy.
     pub(crate) fn detach(&mut self) -> std::result::Result<(), Fault> {
         for window in self.entries.values_mut() {
-            if window.stage != Stage::Invalidated {
+            if !window.control.is_invalidated() {
                 window
                     .backing
                     .cleanup_step(|b| b.api.free_window(&mut b.mw))?;
@@ -168,6 +154,7 @@ impl QueuePair {
         permissions: Permissions,
     ) -> Result<SharedWindow> {
         self.connected()?;
+        let qpn = self.parameters().qpn;
         let q = self.owner.get_mut()?;
         let qp = q.qp.ok_or(Error::Closed)?;
         q.send_capacity(1)?;
@@ -176,6 +163,8 @@ impl QueuePair {
             .try_reserve(1)
             .map_err(|_| Error::Exhausted("shared windows"))?;
         let id = reserve_ids(2)?;
+        let mut control = SharedWindowControl::default();
+        control.bind(qpn, id)?;
         let loan = memory.window_loan(&q.domain, range, permissions)?;
         let mut backing = Owner::new(Backing {
             api: q.api,
@@ -197,13 +186,7 @@ impl QueuePair {
         if receipt.accepted == Some(0) {
             return Err(backing.rollback(error));
         }
-        q.windows.entries.insert(
-            id,
-            Window {
-                stage: Stage::Binding,
-                backing,
-            },
-        );
+        q.windows.entries.insert(id, Window { control, backing });
         q.windows.pending += 1;
         if receipt.code != 0 || receipt.accepted != Some(1) {
             q.payload.fenced = true;
@@ -228,7 +211,7 @@ impl SharedWindow {
         q.windows
             .entries
             .get(&self.id)
-            .map(|w| w.stage)
+            .map(|w| w.control.stage)
             .ok_or(Error::Invalid("window belongs to another queue"))
     }
     /// Returns a directional descriptor once this window's bind has completed.
@@ -284,6 +267,9 @@ impl SharedWindow {
         let stage = self.stage(qp)?;
         let q = qp.owner.get_mut()?;
         match stage {
+            Stage::Unbound | Stage::Failed => {
+                Err(Error::Invalid("shared window cannot be revoked"))
+            }
             Stage::Binding | Stage::Invalidating => Ok(false),
             Stage::Ready => {
                 match q.send_capacity(1) {
@@ -308,7 +294,8 @@ impl SharedWindow {
                     .entries
                     .get_mut(&self.id)
                     .ok_or(Error::Closed)?
-                    .stage = Stage::Invalidating;
+                    .control
+                    .revoke(self.id + 1)?;
                 q.windows.pending += 1;
                 Ok(false)
             }

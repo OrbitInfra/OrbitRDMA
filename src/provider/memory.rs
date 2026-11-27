@@ -323,3 +323,44 @@ pub unsafe fn remote_key(memory: &Memory) -> u32 {
     // SAFETY: registration and lifetime are guaranteed by the caller.
     unsafe { (*memory.mr.cast::<ffi::ibv_mr>()).rkey }
 }
+
+/// Prepare a type-2B window with a private bind-only MR covering exactly this
+/// host range. Each concurrently open window needs its own empty handle slots.
+/// Use a fresh PD-scoped key and a SharedWindowControl for its BIND and LOCAL_INV.
+///
+/// # Safety
+/// Supply valid exclusive slots, a live matching QP/PD (or a QP yet to be
+/// created in that PD), and a stable DMA loan. Retain partial construction
+/// outputs on error. After local invalidation, deallocate the MW and deregister
+/// the MR before releasing the loan, including on cleanup failure.
+pub unsafe fn prepare_shared_window(
+    connection: *mut ConnectionHandles,
+    memory: &mut Memory,
+    device: *const DeviceHandles,
+    buffer: *mut c_void,
+    length: usize,
+    permission: u32,
+) -> c_int {
+    if !memory.mr.is_null()
+        || !memory.mw.is_null()
+        || memory.remote_mr
+        || memory.gpu_parent
+        || buffer.is_null()
+        || length == 0
+        || !(1..=3).contains(&permission)
+    {
+        return libc::EINVAL;
+    }
+    // SAFETY: the caller owns empty slots and retains this exact host range and PD.
+    unsafe {
+        prepare_grant(
+            connection,
+            memory,
+            device,
+            buffer,
+            length,
+            permission,
+            RegistrationSource::Host,
+        )
+    }
+}
