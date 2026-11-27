@@ -61,7 +61,11 @@ impl DatagramQueue {
             .owner
             .cleanup_step(|d| {
                 if let Some(route) = &mut d.route {
-                    route.close()
+                    if let Err(fault) = route.close() {
+                        d.payload.quarantine(fault);
+                        return Err(fault);
+                    }
+                    Ok(())
                 } else {
                     Ok(())
                 }

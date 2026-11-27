@@ -32,8 +32,8 @@ impl Native {
             },
             ..Default::default()
         };
-        // SAFETY: the owner retains pd throughout SRQ life; attr is initialized and writable.
         let srq = handle(
+            // SAFETY: the owner retains pd throughout SRQ life; attr is initialized and writable.
             unsafe { create(pd.0.as_ptr(), &mut attr) },
             "ibv_create_srq",
         )?;

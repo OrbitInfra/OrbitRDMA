@@ -301,15 +301,21 @@ struct Signaling {
 }
 
 fn post_status(receipt: sys::transfer::PostReceipt, receive: bool) -> Result<PostStatus> {
+    native_post_status(
+        receipt,
+        if receive {
+            "ibv_post_recv"
+        } else {
+            "ibv_post_send"
+        },
+    )
+}
+fn native_post_status(
+    receipt: sys::transfer::PostReceipt,
+    operation: &'static str,
+) -> Result<PostStatus> {
     match (receipt.code, receipt.accepted) {
-        (code, Some(0)) => Err(Error::Native {
-            operation: if receive {
-                "ibv_post_recv"
-            } else {
-                "ibv_post_send"
-            },
-            code,
-        }),
+        (code, Some(0)) => Err(Error::Native { operation, code }),
         (0, Some(_)) => Ok(PostStatus::Complete),
         (code, Some(_)) => Ok(PostStatus::Partial { code }),
         (code, None) => Ok(PostStatus::Uncertain { code }),

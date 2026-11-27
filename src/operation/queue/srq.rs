@@ -100,7 +100,7 @@ impl SharedReceiveQueue {
         let state: Arc<Mutex<State>> = Arc::default();
         let (api, _, _) = d.domain.native()?;
         let receipt = api.post_srq(srq, id, loan.address(), length, sys::local_key(loan.mr()))?;
-        let status = post_status(receipt, true)?;
+        let status = native_post_status(receipt, "ibv_post_srq_recv")?;
         if let PostStatus::Uncertain { code } = status {
             lock(&state).fail(TransferFailure::Post { code }, false);
         }

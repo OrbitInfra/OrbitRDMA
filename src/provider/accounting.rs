@@ -20,18 +20,22 @@ impl WorkNamespaces {
         })
     }
     pub fn reserve(&self) -> Result<u64> {
-        let mut current = self.next.load(Ordering::Relaxed);
+        Self::reserve_from(&self.next, self.stride)
+    }
+    /// Reserve against an external lane's monotonic counter. Initialize it to
+    /// one and retain it through every QP that may return completions to the lane.
+    pub fn reserve_from(counter: &AtomicU64, stride: u64) -> Result<u64> {
+        if stride < 2 {
+            return Err(Error::Invalid("work namespace stride"));
+        }
+        let mut current = counter.load(Ordering::Relaxed);
         loop {
             let next = current
                 .checked_add(1)
-                .filter(|n| n.checked_mul(self.stride).is_some())
+                .filter(|n| current != 0 && n.checked_mul(stride).is_some())
                 .ok_or(Error::Exhausted("work namespaces"))?;
-            match self.next.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(current),
                 Err(observed) => current = observed,
             }
