@@ -198,12 +198,13 @@ pub enum ReceiveSlot {
     #[default]
     Idle,
     Reserved,
+    PossiblyPosted,
     Posted,
     Retired,
 }
 impl ReceiveSlot {
     pub fn pending(self) -> bool {
-        matches!(self, Self::Reserved | Self::Posted)
+        matches!(self, Self::Reserved | Self::PossiblyPosted | Self::Posted)
     }
     pub fn reserve(&mut self) -> Result<()> {
         if *self != Self::Idle {
@@ -218,12 +219,11 @@ impl ReceiveSlot {
             return Err(Error::Invalid("receive lacks reservation"));
         }
         let prefix = receipt.possible_prefix(1);
-        if prefix == (0, false) {
-            *self = Self::Idle;
-        }
-        if prefix == (1, false) && receipt.code == 0 {
-            *self = Self::Posted;
-        }
+        *self = match prefix {
+            (0, false) => Self::Idle,
+            (1, false) if receipt.code == 0 => Self::Posted,
+            _ => Self::PossiblyPosted,
+        };
         Ok(prefix)
     }
     /// Returns whether a physical credit was previously outstanding.
@@ -290,6 +290,14 @@ mod tests {
             })
             .unwrap(),
             (1, true)
+        );
+        assert!(slot.pending());
+        assert!(
+            slot.posted(PostReceipt {
+                accepted: Some(0),
+                code: libc::EIO
+            })
+            .is_err()
         );
         assert!(slot.pending());
         assert!(slot.retire());
