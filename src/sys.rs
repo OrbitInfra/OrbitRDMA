@@ -17,7 +17,6 @@ mod queue;
 pub(crate) mod transfer;
 pub(crate) use device::{Caps, Context, Pd};
 pub(crate) use memory::{Bind, Mr, Mw};
-#[cfg(feature = "provider")]
 pub(crate) use memory::{WindowBind, post_window};
 pub(crate) use queue::{Channel, Cq, Qp, RcPath};
 pub(crate) const RC_READ_WRITE: u32 = ffi::IBV_ACCESS_REMOTE_READ | ffi::IBV_ACCESS_REMOTE_WRITE;

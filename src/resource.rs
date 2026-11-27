@@ -47,16 +47,27 @@ impl<T: Cleanup> Owner<T> {
         self.data.as_ref()
     }
     pub(crate) fn release(&mut self) -> Result<Option<T>> {
+        self.retire().map_err(Fault::unquiesced)
+    }
+    pub(crate) fn retire(&mut self) -> std::result::Result<Option<T>, Fault> {
+        self.cleanup_step(T::cleanup)?;
+        Ok(self.data.take())
+    }
+    /// Run one teardown step while keeping all owners and any failure sticky.
+    pub(crate) fn cleanup_step(
+        &mut self,
+        step: impl FnOnce(&mut T) -> std::result::Result<(), Fault>,
+    ) -> std::result::Result<(), Fault> {
         if let Some(fault) = self.failed {
-            return Err(fault.unquiesced());
+            return Err(fault);
         }
         if let Some(data) = &mut self.data {
-            if let Err(fault) = data.cleanup() {
+            if let Err(fault) = step(data) {
                 self.failed = Some(fault);
-                return Err(fault.unquiesced());
+                return Err(fault);
             }
         }
-        Ok(self.data.take())
+        Ok(())
     }
     pub(crate) fn rollback(&mut self, cause: Error) -> Error {
         self.release().err().unwrap_or(cause)

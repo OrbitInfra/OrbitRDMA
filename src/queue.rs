@@ -59,21 +59,38 @@ pub(crate) struct QueueData {
     pub cq: Option<sys::Cq>,
     pub channel: Option<sys::Channel>,
     pub payload: crate::operation::PayloadQueue,
+    pub windows: crate::window::Windows,
     _permit: Permit,
+}
+impl QueueData {
+    fn destroy_qp(&mut self) -> std::result::Result<(), Fault> {
+        if !self.windows.is_empty() {
+            // RESET removes outstanding local WRs, including a delayed or uncertain
+            // bind. RXE can reject QP destruction while a type-2 MW is still bound.
+            self.api.reset(
+                self.qp
+                    .ok_or(Fault("reset shared-window QP", libc::EBADF))?,
+            )?;
+            self.windows.detach()?;
+        }
+        sys::destroy(&mut self.qp, "ibv_destroy_qp", self.api.ibv_destroy_qp)
+    }
 }
 impl Cleanup for QueueData {
     fn cleanup(&mut self) -> std::result::Result<(), Fault> {
-        if let Err(fault) = sys::destroy(&mut self.qp, "ibv_destroy_qp", self.api.ibv_destroy_qp) {
+        if let Err(fault) = self.destroy_qp() {
             self.payload.quarantine(fault);
             return Err(fault);
         }
         self.payload.drained();
+        let windows = self.windows.drain();
         sys::destroy(&mut self.cq, "ibv_destroy_cq", self.api.ibv_destroy_cq)?;
         sys::destroy(
             &mut self.channel,
             "ibv_destroy_comp_channel",
             self.api.ibv_destroy_comp_channel,
-        )
+        )?;
+        windows
     }
 }
 
@@ -113,6 +130,7 @@ impl Device {
             cq: None,
             channel: None,
             payload: crate::operation::PayloadQueue::new(config),
+            windows: Default::default(),
             _permit: domain.reserve(Charge::Queue)?,
         });
         let create = (|| {
@@ -215,7 +233,10 @@ impl QueuePair {
     pub(crate) fn drained(&self) -> bool {
         self.owner.retained().is_none_or(|r| r.qp.is_none())
     }
-    /// Destroys the QP, CQ and channel in that order. A failed destroy is terminal.
+    /// Retires remaining grants, the QP, CQ and completion channel. With live
+    /// windows it resets the QP and detaches their keys before destroying the QP.
+    /// The backing stays held through QP destruction and MR deregistration.
+    /// A failed native teardown step is terminal.
     pub fn close(&mut self) -> Result<()> {
         self.owner.release().map(drop)
     }

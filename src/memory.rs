@@ -81,6 +81,16 @@ pub enum Permissions {
     RemoteWrite,
     RemoteReadWrite,
 }
+impl Permissions {
+    pub(crate) fn allows(self, access: crate::RemoteAccess) -> bool {
+        matches!(
+            (self, access),
+            (Self::RemoteReadWrite, _)
+                | (Self::RemoteRead, crate::RemoteAccess::Read)
+                | (Self::RemoteWrite, crate::RemoteAccess::Write)
+        )
+    }
+}
 
 struct MrData {
     domain: Arc<Domain>,
@@ -261,20 +271,31 @@ impl RegisteredMemory {
         range: Range<usize>,
         access: crate::RemoteAccess,
     ) -> Result<Loan> {
+        let permissions = match access {
+            crate::RemoteAccess::Read => Permissions::RemoteRead,
+            crate::RemoteAccess::Write => Permissions::RemoteWrite,
+        };
+        self.window_loan(domain, range, permissions)
+    }
+    pub(crate) fn window_loan(
+        &self,
+        domain: &Arc<Domain>,
+        range: Range<usize>,
+        permissions: Permissions,
+    ) -> Result<Loan> {
+        use crate::RemoteAccess::{Read, Write};
         let region = self.inner.as_ref().ok_or(Error::Closed)?;
         if !Arc::ptr_eq(domain, &lock(&region.state).owner.get()?.domain) {
             return Err(Error::Invalid("foreign protection domain"));
         }
-        let write = access == crate::RemoteAccess::Write;
-        if !matches!(
-            (region.permissions, write),
-            (Permissions::RemoteReadWrite, _)
-                | (Permissions::RemoteRead, false)
-                | (Permissions::RemoteWrite, true)
-        ) {
+        if permissions == Permissions::Local
+            || [Read, Write]
+                .into_iter()
+                .any(|dir| permissions.allows(dir) && !region.permissions.allows(dir))
+        {
             return Err(Error::PermissionDenied);
         }
-        self.claim(range, write)
+        self.claim(range, permissions.allows(Write))
     }
     /// Returns the original backing after the final loan and successful deregistration.
     /// Idle range descriptors become closed, including those in an uncollected completion.
@@ -303,6 +324,9 @@ unsafe impl Send for Loan {}
 // SAFETY: sharing a loan permits at most read access. Mutation requires an exclusive guard.
 unsafe impl Sync for Loan {}
 impl Loan {
+    pub(crate) fn register_window(&self, api: &sys::Native, pd: sys::Pd) -> Result<sys::Mr> {
+        api.register(pd, self.pointer, self.length, true)
+    }
     pub(crate) fn address(&self) -> u64 {
         self.pointer.as_ptr() as usize as u64
     }

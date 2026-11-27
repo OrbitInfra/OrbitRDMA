@@ -1,7 +1,8 @@
 //! Linux RC RDMA transfers with registered host buffers and explicit completion receipts.
-//! Exchange [`ConnectionParams`] over your control channel and grant an exact
-//! registered range with [`QueuePair::expose`]. Call [`RemoteWindow::revoke`]
-//! to determine when the buffer may be borrowed again.
+//! Exchange [`ConnectionParams`] over your control channel. Grant independent
+//! ranges on the same QP with [`QueuePair::expose_window`] and poll
+//! [`SharedWindow::revoke`] to learn when a range may be borrowed again.
+//! [`QueuePair::expose`] dedicates a connected QP to a single grant.
 //! Use [`QueuePair::submit`] to post READ, WRITE, SEND or RECV. Drive the CQ with
 //! [`QueuePair::progress`] or [`Operation::wait_until`] and recover each range with
 //! [`Operation::try_reclaim`].
@@ -43,7 +44,7 @@ pub use operation::{
 #[cfg(target_os = "linux")]
 pub use queue::{ConnectionParams, QueueConfig, QueuePair};
 #[cfg(target_os = "linux")]
-pub use window::{RemoteAccess, RemoteDescriptor, RemoteWindow};
+pub use window::{RemoteAccess, RemoteDescriptor, RemoteWindow, SharedWindow};
 
 /// Submit work and poll completions on RC queues owned by another verbs runtime.
 /// Callers retain their QP, CQ, memory registrations and DMA loans. Applications

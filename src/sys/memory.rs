@@ -140,8 +140,8 @@ pub(crate) fn post_window(
     let post = unsafe { (*(*qp.0.as_ptr()).context).ops.post_send }
         .ok_or(Error::Unsupported("post_send"))?;
     let mut bad = std::ptr::null_mut();
-    // SAFETY: the provider consumes the stack WR during this call. On any
-    // submit error the owner tears down the QP before freeing potential DMA targets.
+    // SAFETY: the provider consumes the stack WR during this call. The caller
+    // retains potential DMA targets across uncertain post results.
     let code = unsafe { post(qp.0.as_ptr(), &mut wr, &mut bad) };
     Ok(PostReceipt::receipt(code, bad, std::slice::from_ref(&wr)))
 }
