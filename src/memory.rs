@@ -125,6 +125,9 @@ struct Registration {
 /// A registered host buffer whose local guards and remote windows share range exclusion.
 pub struct RegisteredMemory {
     inner: Option<Arc<Region>>,
+    // Only deregister(&mut self) can invalidate the extent of this handle.
+    // Actual access through any descriptor still acquires a live range loan.
+    extent: std::result::Result<usize, Fault>,
 }
 
 /// An owned registration and byte range. CPU and DMA access still require a loan.
@@ -197,6 +200,7 @@ impl Device {
         }
         let permit = domain.reserve(Charge::Region(buffer.len))?;
         let mr = api.register(pd, buffer.address, buffer.len, bind)?;
+        let extent = Ok(buffer.len);
         let data = MrData {
             domain: domain.clone(),
             mr: Some(mr),
@@ -205,6 +209,7 @@ impl Device {
             _permit: permit,
         };
         Ok(RegisteredMemory {
+            extent,
             inner: Some(Arc::new(Region {
                 state: Mutex::new(Registration {
                     owner: Owner::new(data),
@@ -216,8 +221,8 @@ impl Device {
     }
 }
 impl Region {
-    fn check(data: &MrData, range: &Range<usize>) -> Result<()> {
-        if range.start >= range.end || range.end > data.buffer.len {
+    fn check(length: usize, range: &Range<usize>) -> Result<()> {
+        if range.start >= range.end || range.end > length {
             return Err(Error::Invalid("registered range"));
         }
         Ok(())
@@ -236,7 +241,7 @@ impl Region {
             return Err(Error::Invalid("foreign protection domain"));
         }
         let mr = data.mr.ok_or(Error::Closed)?;
-        Self::check(data, &range)?;
+        Self::check(data.buffer.len, &range)?;
         if claims
             .entries
             .iter()
@@ -273,9 +278,10 @@ impl Region {
 }
 impl RegisteredMemory {
     /// Selects bytes for a transfer without borrowing them until submission.
+    #[inline]
     pub fn range(&self, bounds: Range<usize>) -> Result<RegisteredRange> {
         let region = self.inner.as_ref().ok_or(Error::Closed)?;
-        Region::check(lock(&region.state).owner.get()?, &bounds)?;
+        Region::check(self.extent.map_err(Fault::unquiesced)?, &bounds)?;
         Ok(RegisteredRange {
             region: region.clone(),
             bounds,
@@ -337,7 +343,14 @@ impl RegisteredMemory {
         if !state.claims.entries.is_empty() {
             return Err(Error::Busy);
         }
-        let data = state.owner.release()?.ok_or(Error::Closed)?;
+        let data = state
+            .owner
+            .retire()
+            .map_err(|fault| {
+                self.extent = Err(fault);
+                fault.unquiesced()
+            })?
+            .ok_or(Error::Closed)?;
         drop(state);
         self.inner = None;
         Ok(data.buffer)

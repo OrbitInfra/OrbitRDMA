@@ -26,6 +26,23 @@ struct Pending {
     extra: Vec<Loan>,
 }
 impl Pending {
+    fn operation(&self, buffer: crate::RegisteredRange) -> Operation {
+        Operation {
+            id: self.id,
+            state: self.state.clone(),
+            affects_peer: self.affects_peer,
+            buffer,
+        }
+    }
+    /// A signaled, singleton SEND can only retire on its own local success CQE.
+    fn matches_send(&self, qpn: u32, entry: crate::verbs::CompletionEntry) -> bool {
+        self.group == self.id
+            && self.signaled
+            && self.opcode == sys::DataOpcode::Send
+            && matches!(entry.work, sys::WorkCompletion::Success {
+                id, qpn: actual, opcode: sys::ffi::IBV_WC_SEND, ..
+            } if id == self.id && actual == qpn)
+    }
     fn finish(
         self,
         outcome: Outcome,
@@ -135,6 +152,25 @@ impl PayloadQueue {
             self.receive_count -= 1;
         }
         p
+    }
+    #[inline]
+    fn finish_single_send(&mut self, qpn: u32, entry: crate::verbs::CompletionEntry) -> bool {
+        if !matches!(self.pending.as_slice(), [item] if item.matches_send(qpn, entry)) {
+            return false;
+        }
+        if let Some(done) = self.pending.pop() {
+            let bytes = done.length;
+            done.finish(
+                Outcome::Success {
+                    bytes,
+                    invalidated_rkey: None,
+                },
+                None,
+                None,
+            );
+            return true;
+        }
+        false
     }
     pub(crate) fn completion(
         &mut self,
@@ -334,6 +370,7 @@ impl QueueData {
         self.payload
             .capacity(count.saturating_add(self.windows.pending()), false)
     }
+    #[inline]
     fn prepare(
         &mut self,
         r: &Request,
@@ -388,12 +425,8 @@ impl QueueData {
             .try_reserve(count)
             .map_err(|_| Error::Exhausted("in-flight WRs"))
     }
-    fn accept(
-        &mut self,
-        p: Pending,
-        buffer: crate::RegisteredRange,
-        status: PostStatus,
-    ) -> Operation {
+    #[inline]
+    fn record(&mut self, p: Pending, status: PostStatus) -> usize {
         if let PostStatus::Uncertain { code } = status {
             lock(&p.state).fail(TransferFailure::Post { code }, p.affects_peer);
         }
@@ -407,15 +440,51 @@ impl QueueData {
         }
         self.payload.fenced |= status != PostStatus::Complete;
         self.payload.used = true;
-        let operation = Operation {
-            id: p.id,
-            buffer,
-            state: p.state.clone(),
-            affects_peer: p.affects_peer,
-        };
+        let index = self.payload.pending.len();
         self.payload.pending.push(p);
-        operation
+        index
     }
+    fn accept(
+        &mut self,
+        p: Pending,
+        buffer: crate::RegisteredRange,
+        status: PostStatus,
+    ) -> Operation {
+        let index = self.record(p, status);
+        self.payload.pending[index].operation(buffer)
+    }
+
+    #[inline]
+    fn post_rc_message(&mut self, buffer: &crate::RegisteredRange) -> Result<(usize, PostStatus)> {
+        let qp = self.qp.ok_or(Error::Closed)?;
+        self.reserve_pending(1, false)?;
+        let id = reserve_ids(1)?;
+        let length =
+            u32::try_from(buffer.bounds().len()).map_err(|_| Error::Invalid("SGE length"))?;
+        let loan = buffer.dma(&self.domain, false, false, length as usize)?;
+        let state = self.payload.next_state();
+        let receipt = self
+            .api
+            .post_rc_send(qp, id, &loan, length, self.payload.last_read)?;
+        let status = post_status(receipt, false)?;
+        let index = self.record(
+            Pending {
+                id,
+                group: id,
+                opcode: sys::DataOpcode::Send,
+                signaled: true,
+                length,
+                affects_peer: true,
+                state,
+                loan,
+                extra: Vec::new(),
+            },
+            status,
+        );
+        Ok((index, status))
+    }
+
+    #[inline]
     fn post_one(
         &mut self,
         r: &Request,
@@ -533,16 +602,27 @@ impl QueueData {
             + self.windows.pending()
             + self.srq.as_ref().map_or(Ok(0), |s| s.outstanding())?)
     }
+    #[inline]
     fn progress(&mut self, qpn: u32) -> Result<usize> {
         let cq = self.cq.ok_or(Error::Closed)?;
         let pending = self.outstanding()?;
         if pending <= 1 {
             if let Some(wc) = self.api.poll_entry(cq, self.payload.datagram)? {
+                if self.srq.is_none()
+                    && self.windows.is_empty()
+                    && !self.payload.datagram
+                    && self.payload.finish_single_send(qpn, wc)
+                {
+                    return Ok(1);
+                }
                 self.completion(qpn, wc)?;
                 return Ok(1);
             }
             return Ok(0);
         }
+        self.progress_batch(cq, qpn, pending)
+    }
+    fn progress_batch(&mut self, cq: sys::Cq, qpn: u32, pending: usize) -> Result<usize> {
         use crate::verbs::CompletionBatch;
         let mut batch = CompletionBatch::default();
         let count = self
@@ -606,7 +686,76 @@ impl QueuePair {
         &mut self,
         request: Request,
     ) -> std::result::Result<SingleSubmission, RejectedOne> {
-        self.submit_single(request, None)
+        if !matches!(request.transfer, Transfer::Send) {
+            return self.submit_single(request, None);
+        }
+        let admitted = self.posting_queue().and_then(|(d, _, _)| {
+            let (index, status) = d.post_rc_message(&request.buffer)?;
+            Ok((d, index, status))
+        });
+        match admitted {
+            Ok((d, index, status)) => Ok(SingleSubmission {
+                status,
+                operation: d.payload.pending[index].operation(request.buffer),
+            }),
+            Err(error) => Err(RejectedOne { error, request }),
+        }
+    }
+    /// Posts a signaled SEND. On an idle private CQ this also performs one
+    /// nonblocking poll. Only an exact successful SEND receipt can return the
+    /// buffer directly. An empty poll, an ambiguous post or a CQ error hands
+    /// back the tracked operation; keep driving the queue or close it to drain.
+    pub fn send_and_poll(
+        &mut self,
+        buffer: crate::RegisteredRange,
+    ) -> std::result::Result<PolledSend, RejectedOne> {
+        let admitted = self.posting_queue().and_then(|(d, _, local)| {
+            let cq = d.cq.ok_or(Error::Closed)?;
+            let idle = d.shared_cq.is_none()
+                && d.srq.is_none()
+                && d.windows.is_empty()
+                && d.payload.pending.is_empty();
+            let (index, status) = d.post_rc_message(&buffer)?;
+            Ok((d, index, status, cq, local.qpn, idle))
+        });
+        let (d, index, status, cq, qpn, idle) = match admitted {
+            Ok(posted) => posted,
+            Err(error) => {
+                return Err(RejectedOne {
+                    error,
+                    request: Request::new(buffer, Transfer::Send),
+                });
+            }
+        };
+        // The physical loan is already on the QP, including across a failed poll.
+        let polled = if idle && status == PostStatus::Complete {
+            d.api.poll_entry(cq, false)
+        } else {
+            Ok(None)
+        };
+        if matches!(&polled, Ok(Some(wc)) if d.payload.pending[index].matches_send(qpn, *wc)) {
+            let done = d.payload.take(index);
+            let bytes = done.length;
+            drop(done);
+            return Ok(PolledSend::Completed(Completion {
+                buffer,
+                outcome: Outcome::Success {
+                    bytes,
+                    invalidated_rkey: None,
+                },
+            }));
+        }
+        let operation = d.payload.pending[index].operation(buffer);
+        let progress_error = match polled {
+            Ok(Some(wc)) => d.completion(qpn, wc).err(),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        d.payload.fenced |= progress_error.is_some();
+        Ok(PolledSend::Tracked {
+            submission: SingleSubmission { status, operation },
+            progress_error,
+        })
     }
     /// Posts a single SEND or WRITE carrying a host-order 32-bit receive notification.
     pub fn submit_with_immediate(
@@ -684,6 +833,7 @@ impl QueuePair {
         result.map_err(|error| Rejected { error, requests })
     }
     /// Polls up to 32 actual CQEs. A successful group tail may retire multiple WRs.
+    #[inline]
     pub fn progress(&mut self) -> Result<usize> {
         let qpn = self.parameters().qpn;
         let d = self.owner.get_mut()?;

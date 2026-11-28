@@ -15,3 +15,15 @@ BENCH_BIN_DIR="$CARGO_TARGET_DIR/release" python3 benches/comparison/run.py 16
 Build the Orbit caller with `--features single` to select `submit_one`. Its default calls the existing list API even at QD1. To compare revisions, build the same caller against each checkout, save each executable with its own `bench-NAME` basename, then supply pairs such as `old:send new:send old:burst new:burst` after the round count. QD1 has 500 warmups and 5,000 timed operations per process pair. The QD32 burst posts 32 individually signaled WRITEs in one native list and drains all receipts before starting the next batch. It reports time per batch over 450 measured batches after 50 warmups. All 32 writes target the same 4 KiB range on a single RC QP. This measures queue overhead and is not a streaming link-bandwidth test. The summary is the median of the individual round percentiles.
 
 The lockfiles pin ibverbs 0.9.2 and async-rdma 0.5.0, including the previously published transitive dependency used by async-rdma. Soft-RoCE timings characterize the software provider and this workload. Run on two physical hosts to publish NIC throughput or cross-host tail latency.
+
+For the busy-polling RC SEND path, compare these workloads with the same build and receiver:
+
+```bash
+cargo build --release --locked --features single --manifest-path benches/comparison/orbit/Cargo.toml
+BENCH_BIN_DIR="$CARGO_TARGET_DIR/release" python3 benches/comparison/run.py 24 \
+    verbs:send orbit:send orbit:send_polled orbit:send_reuse
+```
+
+`send` selects a fresh range and uses the ordinary submit/progress/reclaim loop. `send_polled` selects the same range inside the timer and calls `send_and_poll`. `send_reuse` gives the previous completion's range back to the next SEND. All three include the DMA loan, its retirement, and a successful byte-count check in the timed interval. The receiver uses the ordinary RECV path in all three modes.
+
+Build both callers a second time with `--features send-stages` (and `single` for OrbitRDMA) to time submit, CQ progress and reclaim separately. Stage timestamps perturb the run. Use ordinary release builds for end-to-end comparisons. When benchmarking a published OrbitRDMA version, set the Orbit caller's dependency to the exact registry version, resolve its lockfile, and check the registry checksum.

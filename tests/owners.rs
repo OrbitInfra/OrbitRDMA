@@ -368,9 +368,13 @@ fn external_backing_range_conflicts_and_registration_cleanup() {
             let mut mr = d.register(buf, Permissions::Local).unwrap();
             p.fault("free_mr", "");
             let before = p.count("free_mr");
+            let earlier = mr.range(1..4).unwrap();
             cleanup(mr.deregister().err().unwrap(), "ibv_dereg_mr");
             p.fault("", "");
+            cleanup(mr.range(1..4).err().unwrap(), "ibv_dereg_mr");
+            cleanup(earlier.read().err().unwrap(), "ibv_dereg_mr");
             cleanup(mr.deregister().err().unwrap(), "ibv_dereg_mr");
+            drop(earlier);
             drop(mr);
             assert_eq!(p.count("free_mr"), before + 1);
             assert_eq!(kept.load(Ordering::SeqCst), 0);

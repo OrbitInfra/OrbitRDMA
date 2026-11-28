@@ -117,6 +117,17 @@ pub struct SingleSubmission {
     pub status: PostStatus,
     pub operation: Operation,
 }
+/// Result of posting a single RC SEND and checking once for a local CQE.
+pub enum PolledSend {
+    /// The provider returned this SEND's successful CQE and all loans were released.
+    Completed(Completion),
+    /// The queue owns the ordinary receipt. It may already record a failed CQE.
+    /// A progress error leaves the original operation available for inspection or drain.
+    Tracked {
+        submission: SingleSubmission,
+        progress_error: Option<Error>,
+    },
+}
 /// Receipt for a single native list post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostStatus {

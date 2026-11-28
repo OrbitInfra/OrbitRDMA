@@ -739,6 +739,296 @@ fn single_post_preserves_range_and_charges_across_native_failures() {
 }
 
 #[test]
+fn polled_send_returns_bytes_only_for_its_local_success() {
+    case(
+        "polled_send_returns_bytes_only_for_its_local_success",
+        |_| {
+            let (left, right) = (device(), device());
+            let (mut tx, mut rx) = pair(&left, &right, 1);
+            let src = left.register(bytes(8), Permissions::Local).unwrap();
+            let dst = right.register(bytes(8), Permissions::Local).unwrap();
+            dst.write(0..8).unwrap().fill(0xba);
+            src.write(1..7).unwrap().copy_from_slice(b"abcdef");
+            let receive = rx
+                .submit_one(Request::new(dst.range(1..7).unwrap(), Transfer::Receive))
+                .unwrap()
+                .operation;
+            let PolledSend::Completed(c) = tx.send_and_poll(src.range(1..7).unwrap()).unwrap()
+            else {
+                panic!("the provider emitted a matching SEND completion");
+            };
+            assert_eq!(c.outcome, success(6));
+            assert_eq!(c.buffer.bounds(), 1..7);
+            assert_eq!(left.usage().unwrap().send_requests, 0);
+            c.buffer.write().unwrap().fill(0);
+            assert!(matches!(dst.read(0..8), Err(Error::Busy)));
+            rx.progress().unwrap();
+            assert_eq!(ready(receive).outcome, success(6));
+            assert_eq!(&*dst.read(0..8).unwrap(), b"\xbaabcdef\xba");
+
+            // No receive is posted. The failed CQE is a retirement receipt carrying
+            // the provider error, even though the native post itself succeeded.
+            let PolledSend::Tracked {
+                submission,
+                progress_error: None,
+            } = tx.send_and_poll(c.buffer).unwrap()
+            else {
+                panic!("failed CQE must remain observable");
+            };
+            assert_eq!(submission.status, PostStatus::Complete);
+            assert!(matches!(
+                ready(submission.operation).outcome,
+                Outcome::Failed {
+                    reason: TransferFailure::Completion { .. },
+                    remote_effect_unknown: true
+                }
+            ));
+            tx.close().unwrap();
+            rx.close().unwrap();
+        },
+    );
+}
+
+#[test]
+fn polled_send_keeps_delayed_sibling_and_cancelled_loans() {
+    case(
+        "polled_send_keeps_delayed_sibling_and_cancelled_loans",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let mut q = conn(&d);
+            let qpn = q.parameters().qpn;
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            let PolledSend::Tracked {
+                submission: a,
+                progress_error: None,
+            } = q.send_and_poll(m.range(0..4).unwrap()).unwrap()
+            else {
+                panic!("empty poll must return the receipt");
+            };
+            p.emit(qpn, a.operation.id(), qpn, (0, 0, 0), None);
+            let polls = p.count("poll");
+            let PolledSend::Tracked {
+                submission: b,
+                progress_error: None,
+            } = q.send_and_poll(m.range(4..8).unwrap()).unwrap()
+            else {
+                panic!("another request already owns this CQ");
+            };
+            assert_eq!(polls, p.count("poll"));
+            let id = b.operation.id();
+            b.operation.cancel();
+            drop(b);
+            assert_eq!(q.progress().unwrap(), 1);
+            assert_eq!(ready(a.operation).outcome, success(4));
+            assert!(m.write(0..4).is_ok());
+            assert!(matches!(m.write(4..8), Err(Error::Busy)));
+            assert_eq!(d.usage().unwrap().in_flight_bytes, 4);
+            p.emit(qpn, id, qpn, (0, 0, 0), None);
+            q.progress().unwrap();
+            assert!(m.write(4..8).is_ok());
+            q.close().unwrap();
+        },
+    );
+}
+
+#[test]
+fn polled_send_errors_keep_receipts_and_do_not_repost() {
+    case("polled_send_errors_keep_receipts_and_do_not_repost", |p| {
+        let d = device();
+        let m = d.register(bytes(8), Permissions::Local).unwrap();
+        for mode in [
+            "uncertain",
+            "poll",
+            "foreign",
+            "stale",
+            "wrong_opcode",
+            "overreported_poll",
+        ] {
+            p.option("manual");
+            let mut q = conn(&d);
+            let qpn = q.parameters().qpn;
+            p.post_result(0, 0);
+            let rejected = q.send_and_poll(m.range(1..7).unwrap()).err().unwrap();
+            assert!(rejected.request.buffer.write().is_ok());
+            assert_eq!(d.usage().unwrap().in_flight_bytes, 0);
+            let polls = p.count("poll");
+            p.post_result(-1, 0);
+            match mode {
+                "uncertain" => p.post_result(0, 2),
+                "poll" => p.fault("poll", ""),
+                "overreported_poll" => p.option(mode),
+                _ => {
+                    // Learn the next fixture identity from a retired payload WR.
+                    let op = q
+                        .submit_one(Request::new(m.range(0..1).unwrap(), Transfer::Send))
+                        .unwrap()
+                        .operation;
+                    let next = op.id() + 1;
+                    p.emit(qpn, op.id(), qpn, (0, 0, 0), None);
+                    q.progress().unwrap();
+                    assert_eq!(ready(op).outcome, success(1));
+                    match mode {
+                        "foreign" => p.emit(qpn, next, qpn + 1, (0, 0, 0), None),
+                        "stale" => p.emit(qpn, next - 1, qpn, (0, 0, 0), None),
+                        "wrong_opcode" => p.emit(qpn, next, qpn, (2, 6, 0), None),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let posts = p.count("post_send");
+            let PolledSend::Tracked {
+                submission,
+                progress_error,
+            } = q.send_and_poll(rejected.request.buffer).unwrap()
+            else {
+                panic!("unproven completion must retain the range");
+            };
+            assert_eq!(p.count("post_send"), posts + 1);
+            assert!(matches!(m.write(1..7), Err(Error::Busy)));
+            assert_eq!(d.usage().unwrap().send_requests, 1);
+            if mode == "uncertain" {
+                assert_eq!(
+                    submission.status,
+                    PostStatus::Uncertain { code: libc::ENOMEM }
+                );
+                assert_eq!(p.count("poll"), polls);
+                assert!(progress_error.is_none());
+            } else {
+                assert_eq!(submission.status, PostStatus::Complete);
+                assert!(progress_error.is_some());
+            }
+            // An uncertain post or a poll fault fences admission. A successful
+            // destroy (or a later valid CQE) can still retire the original WR.
+            assert!(matches!(
+                q.submit_one(Request::new(m.range(0..1).unwrap(), Transfer::Send))
+                    .err()
+                    .unwrap()
+                    .error,
+                Error::Closed
+            ));
+            p.option("manual");
+            p.fault("", "");
+            q.close().unwrap();
+            assert!(matches!(
+                ready(submission.operation).outcome,
+                Outcome::Failed { .. }
+            ));
+            assert_eq!(d.usage().unwrap().send_requests, 0);
+            assert!(m.write(1..7).is_ok());
+        }
+    });
+}
+
+#[test]
+fn single_send_requires_its_own_completion_or_successful_drain() {
+    case(
+        "single_send_requires_its_own_completion_or_successful_drain",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let (buffer, drops) = external(8);
+            let mut mr = d.register(buffer, Permissions::Local).unwrap();
+            let mut q = conn(&d);
+            let qpn = q.parameters().qpn;
+            p.post_result(0, 0);
+            let rejected = q
+                .submit_one(Request::new(mr.range(1..7).unwrap(), Transfer::Send))
+                .err()
+                .unwrap();
+            assert!(rejected.request.buffer.write().is_ok());
+            assert_eq!(d.usage().unwrap().send_requests, 0);
+
+            p.post_result(0, 2);
+            let sub = q.submit_one(rejected.request).unwrap();
+            assert_eq!(sub.status, PostStatus::Uncertain { code: libc::ENOMEM });
+            let op = sub.operation;
+            let id = op.id();
+            assert_eq!(q.progress().unwrap(), 0);
+            assert!(matches!(mr.write(1..7), Err(Error::Busy)));
+            p.emit(qpn, id, qpn + 1, (0, 0, 0), None);
+            assert!(q.progress().is_err());
+            assert!(matches!(mr.deregister(), Err(Error::Busy)));
+            p.emit(qpn, id, qpn, (2, 6, 0), None);
+            assert!(q.progress().is_err());
+            assert!(matches!(mr.write(1..7), Err(Error::Busy)));
+            assert_eq!(d.usage().unwrap().in_flight_bytes, 6);
+            p.emit(qpn, id, qpn, (0, 0, 0), None);
+            assert_eq!(q.progress().unwrap(), 1);
+            assert!(matches!(
+                ready(op).outcome,
+                Outcome::Failed {
+                    reason: TransferFailure::Post { code: libc::ENOMEM },
+                    remote_effect_unknown: true,
+                }
+            ));
+            assert!(mr.write(1..7).is_ok());
+            q.close().unwrap();
+
+            let mut q = conn(&d);
+            p.post_result(-1, 0);
+            let sub = q
+                .submit_one(Request::new(mr.range(1..7).unwrap(), Transfer::Send))
+                .unwrap();
+            sub.operation.cancel();
+            drop(sub);
+            assert_eq!(q.progress().unwrap(), 0);
+            p.fault("free_qp", "");
+            assert!(matches!(q.close(), Err(Error::Unquiesced { .. })));
+            assert!(matches!(mr.write(1..7), Err(Error::Busy)));
+            assert_eq!(d.usage().unwrap().send_requests, 1);
+            drop(q);
+            drop(mr);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        },
+    );
+}
+
+#[test]
+fn single_send_fences_the_previous_read_and_keeps_its_loan_independent() {
+    case(
+        "single_send_fences_the_previous_read_and_keeps_its_loan_independent",
+        |p| {
+            p.option("manual");
+            let d = device();
+            let remote_device = device();
+            let (mut q, peer) = pair(&d, &remote_device, 1);
+            let qpn = q.parameters().qpn;
+            let m = d.register(bytes(8), Permissions::Local).unwrap();
+            let remote = RemoteDescriptor {
+                qpn: peer.parameters().qpn,
+                address: 16,
+                length: 8,
+                rkey: 1,
+                access: RemoteAccess::Read,
+            };
+            let read = q
+                .submit_one(Request::new(
+                    m.range(0..4).unwrap(),
+                    Transfer::Read { remote, offset: 0 },
+                ))
+                .unwrap()
+                .operation;
+            let fences = p.count("fence");
+            let send = q
+                .submit_one(Request::new(m.range(4..8).unwrap(), Transfer::Send))
+                .unwrap()
+                .operation;
+            assert_eq!(p.count("fence"), fences + 1);
+            p.emit(qpn, send.id(), qpn, (0, 0, 0), None);
+            q.progress().unwrap();
+            assert_eq!(ready(send).outcome, success(4));
+            assert!(m.write(4..8).is_ok());
+            assert!(matches!(m.read(0..4), Err(Error::Busy)));
+            p.emit(qpn, read.id(), qpn, (2, 4, 0), None);
+            q.progress().unwrap();
+            assert_eq!(ready(read).outcome, success(4));
+            q.close().unwrap();
+        },
+    );
+}
+
+#[test]
 fn batch_dispatch_after_malformed_and_impossible_counts() {
     case(
         "batch_dispatch_after_malformed_and_impossible_counts",

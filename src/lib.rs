@@ -41,8 +41,8 @@ pub use memory::{
 #[cfg(target_os = "linux")]
 pub use operation::{
     Completion, DatagramAddress, DatagramQueue, DatagramReceipt, Immediate, Operation, Outcome,
-    PostStatus, Reclaim, Rejected, RejectedOne, Request, SharedReceiveQueue, SingleSubmission,
-    Submission, Transfer, TransferFailure, VectoredSubmission,
+    PolledSend, PostStatus, Reclaim, Rejected, RejectedOne, Request, SharedReceiveQueue,
+    SingleSubmission, Submission, Transfer, TransferFailure, VectoredSubmission,
 };
 #[cfg(target_os = "linux")]
 pub use queue::group::{CompletionGroup, QueueId};

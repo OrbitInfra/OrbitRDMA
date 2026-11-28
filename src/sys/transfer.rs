@@ -412,6 +412,7 @@ fn decode(wc: &ffi::ibv_wc) -> WorkCompletion {
 }
 
 // SAFETY contract inherited by both public polling entry points.
+#[inline]
 unsafe fn poll_into(cq: NonNull<c_void>, entries: &mut [ffi::ibv_wc]) -> Result<usize, Error> {
     let cq = cq.cast::<ffi::ibv_cq>().as_ptr();
     // SAFETY: the caller retains this CQ and its context throughout the call.
@@ -478,6 +479,7 @@ pub unsafe fn poll_entry(cq: NonNull<c_void>) -> Result<Option<CompletionEntry>,
     // SAFETY: the caller retains the CQ. Generic polling reads only common RC/UD fields.
     unsafe { poll_entry_for(cq, false) }
 }
+#[inline]
 unsafe fn poll_entry_for(
     cq: NonNull<c_void>,
     datagram: bool,
@@ -545,6 +547,40 @@ pub unsafe fn poll_batch(
 }
 
 impl Native {
+    /// A signaled single-SGE RC SEND. The acquired loan supplies the validated
+    /// range and stays with the QP for every possibly accepted receipt.
+    #[inline]
+    pub(crate) fn post_rc_send(
+        &self,
+        qp: Qp,
+        id: u64,
+        loan: &crate::memory::Loan,
+        length: u32,
+        fence: bool,
+    ) -> RdmaResult<PostReceipt> {
+        let qp = qp.0.as_ptr();
+        // SAFETY: the owning queue retains this QP and its provider context.
+        let submit = unsafe { (*(*qp).context).ops.post_send };
+        let submit = submit.ok_or(Error::Unsupported("ibv_post_send"))?;
+        let mut sge = ffi::ibv_sge {
+            addr: loan.address(),
+            length,
+            lkey: super::local_key(loan.mr()),
+        };
+        let mut wr = ffi::ibv_send_wr {
+            wr_id: id,
+            sg_list: &mut sge,
+            num_sge: 1,
+            opcode: ffi::IBV_WR_SEND,
+            send_flags: ffi::IBV_SEND_SIGNALED | if fence { ffi::IBV_SEND_FENCE } else { 0 },
+            ..Default::default()
+        };
+        let mut bad = std::ptr::null_mut();
+        // SAFETY: the WR and SGE are live for the synchronous post and the queue
+        // retains the loan for any possible DMA beyond the return.
+        let code = unsafe { submit(qp, &mut wr, &mut bad) };
+        Ok(PostReceipt::receipt(code, bad, std::slice::from_ref(&wr)))
+    }
     pub(crate) fn post_payload(
         &self,
         qp: Qp,
@@ -558,6 +594,7 @@ impl Native {
         unsafe { poll(cq.0.cast()) }
     }
 
+    #[inline]
     pub(crate) fn poll_entry(&self, cq: Cq, datagram: bool) -> RdmaResult<Option<CompletionEntry>> {
         // SAFETY: the owning queue retains the CQ and is its sole consumer.
         unsafe { poll_entry_for(cq.0.cast(), datagram) }
