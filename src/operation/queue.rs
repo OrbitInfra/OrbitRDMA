@@ -701,10 +701,10 @@ impl QueuePair {
             Err(error) => Err(RejectedOne { error, request }),
         }
     }
-    /// Posts a signaled SEND. On an idle private CQ this also performs one
-    /// nonblocking poll. Only an exact successful SEND receipt can return the
-    /// buffer directly. An empty poll, an ambiguous post or a CQ error hands
-    /// back the tracked operation; keep driving the queue or close it to drain.
+    /// Posts a signaled SEND. After a confirmed post, this polls once if the
+    /// QP owns its CQ and has no earlier payloads, shared receive queue or attached windows.
+    /// Only this SEND's successful local CQE returns the range directly.
+    /// Otherwise the caller receives a tracked operation and can drive or drain the queue.
     pub fn send_and_poll(
         &mut self,
         buffer: crate::RegisteredRange,
