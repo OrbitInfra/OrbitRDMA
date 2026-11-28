@@ -4,8 +4,8 @@
 mod completion;
 use completion::{deadline, finish};
 use orbit_rdma::{
-    Device, HostBuffer, Limits, Permissions, QueueConfig, QueuePair, RegisteredMemory,
-    RemoteAccess, RemoteDescriptor, Request, SharedWindow, Transfer,
+    Device, HostBuffer, Limits, Outcome, Permissions, PolledSend, PostStatus, QueueConfig,
+    QueuePair, RegisteredMemory, RemoteAccess, RemoteDescriptor, Request, SharedWindow, Transfer,
 };
 use std::{
     env,
@@ -163,19 +163,39 @@ fn send_receive(
         expected[2..6].copy_from_slice(b"send");
     }
     let mut memory = dev.register(HostBuffer::from_vec(expected.to_vec())?, Permissions::Local)?;
-    let request = if server {
-        Request::new(memory.range(4..10)?, Transfer::Receive)
+    if server {
+        let receive = Request::new(memory.range(4..10)?, Transfer::Receive);
+        let ops = qp.submit(vec![receive])?.operations;
+        control.write_all(b"R")?;
+        finish(qp, ops, &[4])?;
+        expected[4..8].copy_from_slice(b"send");
     } else {
         receive_ack(control, b'R')?;
-        Request::new(memory.range(2..6)?, Transfer::Send)
-    };
-    let ops = qp.submit(vec![request])?.operations;
-    if server {
-        control.write_all(b"R")?;
-    }
-    finish(qp, ops, &[4])?;
-    if server {
-        expected[4..8].copy_from_slice(b"send");
+        match qp.send_and_poll(memory.range(2..6)?)? {
+            PolledSend::Completed(c) => {
+                if c.outcome
+                    != (Outcome::Success {
+                        bytes: 4,
+                        invalidated_rkey: None,
+                    })
+                    || c.buffer.bounds() != (2..6)
+                {
+                    return Err("unexpected local SEND completion".into());
+                }
+            }
+            PolledSend::Tracked {
+                submission,
+                progress_error,
+            } => {
+                if let Some(error) = progress_error {
+                    return Err(error.into());
+                }
+                if submission.status != PostStatus::Complete {
+                    return Err("provider could not confirm the SEND post".into());
+                }
+                finish(qp, vec![submission.operation], &[4])?;
+            }
+        }
     }
     if memory.deregister()?.as_ref() != expected {
         return Err("SEND/RECV payload or guard mismatch".into());

@@ -742,13 +742,20 @@ fn single_post_preserves_range_and_charges_across_native_failures() {
 fn polled_send_returns_bytes_only_for_its_local_success() {
     case(
         "polled_send_returns_bytes_only_for_its_local_success",
-        |_| {
+        |p| {
             let (left, right) = (device(), device());
             let (mut tx, mut rx) = pair(&left, &right, 1);
             let src = left.register(bytes(8), Permissions::Local).unwrap();
             let dst = right.register(bytes(8), Permissions::Local).unwrap();
             dst.write(0..8).unwrap().fill(0xba);
             src.write(1..7).unwrap().copy_from_slice(b"abcdef");
+            let mut other = conn(&left);
+            p.option("manual");
+            let delayed = other
+                .submit_one(Request::new(src.range(3..5).unwrap(), Transfer::Send))
+                .unwrap()
+                .operation;
+            p.option("");
             let receive = rx
                 .submit_one(Request::new(dst.range(1..7).unwrap(), Transfer::Receive))
                 .unwrap()
@@ -759,6 +766,14 @@ fn polled_send_returns_bytes_only_for_its_local_success() {
             };
             assert_eq!(c.outcome, success(6));
             assert_eq!(c.buffer.bounds(), 1..7);
+            assert!(src.write(1..3).is_ok());
+            assert!(matches!(c.buffer.write(), Err(Error::Busy)));
+            assert_eq!(left.usage().unwrap().in_flight_bytes, 2);
+            let qpn = other.parameters().qpn;
+            p.emit(qpn, delayed.id(), qpn, (0, 0, 0), None);
+            other.progress().unwrap();
+            assert_eq!(ready(delayed).outcome, success(2));
+            other.close().unwrap();
             assert_eq!(left.usage().unwrap().send_requests, 0);
             c.buffer.write().unwrap().fill(0);
             assert!(matches!(dst.read(0..8), Err(Error::Busy)));

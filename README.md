@@ -2,7 +2,7 @@
 
 OrbitRDMA is a Rust library for moving bytes between registered host buffers over Linux RDMA. It supports one-sided READ/WRITE and two-sided SEND/RECV on reliable connected (RC) queue pairs. The application chooses its control channel and decides which ranges to expose.
 
-The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.2.0` adds scatter/gather requests, shared queues, atomics, UD datagrams and an optional standard RDMA-CM transport for messages. [Development plan](docs/development-plan.md#delivery-order)
+The standalone Cargo package is `orbit-rdma`, imported as `orbit_rdma`. Version `0.2.1` adds `QueuePair::send_and_poll` for busy-polling RC senders and speeds up single SENDs through the existing `submit_one` API. [Development plan](docs/development-plan.md#delivery-order)
 
 ## Try device discovery
 
@@ -84,11 +84,11 @@ Drive the QP with `progress()`, or call `op.wait_until(&mut qp, deadline)`. A ti
 
 `op.try_reclaim()` returns the original range and its outcome when ready, or a tracked handle while it is pending or unquiesced. Receive and READ destinations have exclusive loans. A WRITE or SEND source permits other readers. The checked-out range can safely be modified again after its last conflicting loan retires. [Packaged four-operation example](tests/package/traffic.rs) · [Failure and reuse tests](tests/unit/transfers.rs)
 
-For a busy-polling RC sender, `qp.send_and_poll(range)` posts one signaled SEND. When the private queue is idle it also polls once. `PolledSend::Completed(c)` returns the range on that SEND's successful local completion. The peer can still be processing the message. `PolledSend::Tracked { submission, progress_error }` preserves the operation on a delayed CQE, an ambiguous post, or a polling error. Inspect the status and drive the queue or close it to drain. After retirement, the next SEND can take the same `Completion::buffer` again. Each post acquires a fresh DMA loan for the bytes.
+For a busy-polling RC sender, `qp.send_and_poll(range)` posts one signaled SEND. When the private queue is idle it also polls once. `PolledSend::Completed(c)` returns the range on that SEND's successful local completion. A write to the range still requires every overlapping reader, including SENDs on other QPs, to finish. The peer can still be processing the message. `PolledSend::Tracked { submission, progress_error }` preserves the operation on a delayed CQE, an ambiguous post, or a polling error. Inspect the status and drive the queue or close it to drain. After retirement, the next SEND can take the same `Completion::buffer` again. Each post acquires a fresh DMA loan for the bytes.
 
 ## Wait with Tokio
 
-The development branch offers a `tokio` Cargo feature. It adds `connect_over_async` for an existing asynchronous stream, `QueuePair::wait_for_progress_async` for CQ progress (including window changes), and `Operation::wait_async` for one posted transfer. Enable I/O on the Tokio runtime.
+The optional `tokio` Cargo feature supports asynchronous clients. It adds `connect_over_async` for an existing asynchronous stream, `QueuePair::wait_for_progress_async` for CQ progress (including window changes), and `Operation::wait_async` for one posted transfer. Enable I/O on the Tokio runtime.
 
 ```rust
 use orbit_rdma::{Error, Operation, QueuePair, Reclaim};
