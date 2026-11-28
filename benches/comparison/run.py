@@ -41,6 +41,11 @@ for k in range(rounds):
                     key=kind if kind.startswith("send") else op
                     rows.setdefault((name,key),[]).append((int(p50),int(p99)))
                     print(k+1,name,key,p50,p99,flush=True)
+                if kind in ("send_polled", "send_reuse"):
+                    hit = re.search(r"^First poll completed (\d+)/(\d+) measured SENDs$", client.stderr, re.M)
+                    if not hit or not 0 <= int(hit[1]) <= int(hit[2]) or int(hit[2]) == 0:
+                        raise RuntimeError((name, kind, "missing first-poll counts", client.stderr))
+                    print(k+1, name, kind, "first_poll", hit[1], hit[2], flush=True)
                 stages=re.findall(r"^STAGE (post|poll|reclaim) (\d+) (\d+)$",client.stdout,re.M)
                 if stages:
                     assert kind == "send" and [s[0] for s in stages] == ["post","poll","reclaim"]

@@ -89,6 +89,8 @@ fn polled_sender(
         };
         if reuse {
             recycled = Some(returned);
+        } else {
+            drop(returned);
         }
         sample(&mut samples, i, start);
         if direct && i >= WARM {
