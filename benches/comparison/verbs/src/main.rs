@@ -1,5 +1,8 @@
 #[path = "../../common.rs"]
 mod common;
+#[cfg(feature = "send-stages")]
+#[path = "../../send_stages.rs"]
+mod send_stages;
 use common::*;
 use std::{io::Write, time::Instant};
 
@@ -30,6 +33,8 @@ fn run() -> Result<()> {
     mr.fill(GUARD);
     barrier(&mut socket)?;
     let mut wc = [ibverbs::ibv_wc::default(); 1];
+    #[cfg(feature = "send-stages")]
+    let mut stages = send_stages::Stages::new();
     let mut samples = Vec::with_capacity(COUNT);
     for i in 0..TOTAL {
         let id = i as u64 + 1;
@@ -52,9 +57,13 @@ fn run() -> Result<()> {
                 q.post_send(&mut mr, 1..N + 1, id)?;
             }
         }
+        #[cfg(feature = "send-stages")]
+        let posted = (!server).then(Instant::now);
         loop {
             let completed = cq.poll(&mut wc)?;
             if let Some(w) = completed.first() {
+                #[cfg(feature = "send-stages")]
+                let observed = posted.map(|_| Instant::now());
                 if !w.is_valid() || w.wr_id() != id || (server && w.len() != N) {
                     return Err(format!(
                         "unexpected CQE {:?} {} {}",
@@ -63,6 +72,10 @@ fn run() -> Result<()> {
                         w.len()
                     )
                     .into());
+                }
+                #[cfg(feature = "send-stages")]
+                if let (Some(post), Some(cq)) = (posted, observed) {
+                    stages.record(i, start, post, cq, Instant::now());
                 }
                 break;
             }
@@ -78,6 +91,8 @@ fn run() -> Result<()> {
     barrier(&mut socket)?;
     if !server {
         report("send", samples);
+        #[cfg(feature = "send-stages")]
+        stages.report();
     }
     Ok(())
 }

@@ -117,6 +117,18 @@ pub struct SingleSubmission {
     pub status: PostStatus,
     pub operation: Operation,
 }
+/// Result of posting a single RC SEND and checking once for a local CQE.
+pub enum PolledSend {
+    /// This SEND has completed locally and released its DMA loan.
+    /// Overlapping loans held by other operations or guards still apply.
+    Completed(Completion),
+    /// The caller receives the usual operation handle, which may already record a failed CQE.
+    /// A polling error preserves the handle and fences new posts on this QP.
+    Tracked {
+        submission: SingleSubmission,
+        progress_error: Option<Error>,
+    },
+}
 /// Receipt for a single native list post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostStatus {

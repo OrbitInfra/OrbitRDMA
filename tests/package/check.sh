@@ -22,7 +22,10 @@ cp "$work/pkg/tests/package/probe.rs" "$work/consumer/src/main.rs"
 cp "$work/pkg/tests/package/connection.rs" "$work/consumer/src/"
 cp "$work/pkg/tests/package/"{traffic,completion,host_peer,async_peer}.rs "$work/consumer/src/"
 cp "$work/pkg/Cargo.lock" "$work/consumer/"
-cargo test --offline --locked --all-features --manifest-path "$work/pkg/Cargo.toml" --test owners
+# Owner tests embed their fixture directory. Keep this temporary extraction's
+# executable with the extraction, including when a caller sets CARGO_TARGET_DIR.
+cargo test --offline --locked --all-features --manifest-path "$work/pkg/Cargo.toml" \
+    --target-dir "$work/build" --test owners
 cat > "$work/consumer/Cargo.toml" <<'TOML'
 [package]
 name = "orbit-rdma-consumer"
